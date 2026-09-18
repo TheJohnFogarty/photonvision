@@ -29,6 +29,7 @@ import org.junit.jupiter.api.Test;
 import org.photonvision.common.configuration.HardwareConfig;
 import org.photonvision.common.hardware.HardwareManager;
 import org.photonvision.common.hardware.gpio.CustomDeviceFactory;
+import org.photonvision.common.hardware.statusLED.RGBStatusLED;
 import org.photonvision.common.util.TestUtils;
 
 public class HardwareConfigTest {
@@ -47,5 +48,51 @@ public class HardwareConfigTest {
         } catch (IOException e) {
             e.printStackTrace();
         }
+    }
+
+    @Test
+    public void emptyLegacyRgbPinsDoesNotCreateStatusLed() {
+        // Matches hardwareConfig stored on a Rubik Pi image after a 2026.3.x JAR:
+        // empty statusRGBPins plus statusRGBActiveHigh must not invent GPIO -1.
+        var json =
+                """
+                {
+                  "deviceName": "",
+                  "ledPins": [],
+                  "ledsCanDim": false,
+                  "ledBrightnessRange": [],
+                  "ledPWMFrequency": 0,
+                  "statusRGBActiveHigh": false,
+                  "statusRGBPins": [],
+                  "getGPIOCommand": "",
+                  "setGPIOCommand": "",
+                  "setPWMCommand": "",
+                  "setPWMFrequencyCommand": "",
+                  "releaseGPIOCommand": "",
+                  "restartHardwareCommand": "",
+                  "vendorFOV": -1.0
+                }
+                """;
+        var config = Jsonb.instance().type(HardwareConfig.class).fromJson(json);
+        assertTrue(config.statusLEDConfig.isEmpty());
+    }
+
+    @Test
+    public void legacyRgbPinsAndActiveHighApplyRegardlessOfJsonOrder() {
+        var json =
+                """
+                {
+                  "statusRGBActiveHigh": true,
+                  "statusRGBPins": [1, 2, 3]
+                }
+                """;
+        var config = Jsonb.instance().type(HardwareConfig.class).fromJson(json);
+        assertTrue(config.statusLEDConfig.isPresent());
+        assertTrue(config.statusLEDConfig.get() instanceof RGBStatusLED.Config);
+        var led = (RGBStatusLED.Config) config.statusLEDConfig.get();
+        assertEquals(1, led.redPin);
+        assertEquals(2, led.greenPin);
+        assertEquals(3, led.bluePin);
+        assertTrue(led.activeHigh);
     }
 }

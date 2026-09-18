@@ -18,15 +18,19 @@
 package org.photonvision.vision.pipeline;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.opencv.core.Rect;
 import org.photonvision.common.LoadJNI;
 import org.photonvision.common.configuration.ConfigManager;
 import org.photonvision.common.util.TestUtils;
 import org.photonvision.vision.apriltag.AprilTagFamily;
 import org.photonvision.vision.camera.QuirkyCamera;
 import org.photonvision.vision.frame.provider.FileFrameProvider;
+import org.photonvision.vision.opencv.CVMat;
+import org.photonvision.vision.pipe.impl.PadRectPipe;
 import org.photonvision.vision.pipeline.result.CVPipelineResult;
 import org.photonvision.vision.target.TargetModel;
 import org.wpilib.math.geometry.Transform3d;
@@ -175,6 +179,124 @@ public class AprilTagTest {
                         pipeline.run(frameProvider.get(), QuirkyCamera.DefaultCamera)) {
                     // the pipeline will only give us Byte.MAX_VALUE many
                     assertEquals(Byte.MAX_VALUE, pipelineResult.targets.size());
+                }
+            }
+        }
+    }
+
+    @Test
+    public void testMlCropRegionDoesNotLeak() {
+        try (var pipeline = new AprilTagPipeline()) {
+            pipeline.getSettings().tagFamily = AprilTagFamily.kTag36h11;
+            pipeline.getSettings().decimate = 1;
+            pipeline.getSettings().mltagEnabled = false;
+
+            try (var frameProvider =
+                    new FileFrameProvider(
+                            TestUtils.getApriltagImagePath(TestUtils.ApriltagTestImages.kTag1_640_480, false),
+                            TestUtils.WPI2020Image.FOV,
+                            TestUtils.get2020LifeCamCoeffs(false))) {
+                frameProvider.requestFrameThresholdType(pipeline.getThresholdType());
+
+                // A normal run initialises the detector params (setPipeParamsImpl) and gives us
+                // the full-frame reference detection: tag centre is near (287, 217) in this image.
+                var frame = frameProvider.get();
+                try (CVPipelineResult ref = pipeline.run(frame, QuirkyCamera.DefaultCamera)) {
+                    assertEquals(1, ref.targets.size());
+                    double refCx =
+                            ref.targets.get(0).getTargetCorners().stream()
+                                    .mapToDouble(p -> p.x)
+                                    .average()
+                                    .orElseThrow();
+                    double refCy =
+                            ref.targets.get(0).getTargetCorners().stream()
+                                    .mapToDouble(p -> p.y)
+                                    .average()
+                                    .orElseThrow();
+
+                    // Region tightly around the tag (tag spans roughly x 260-315, y 190-245), padded.
+                    var region = new Rect(200, 140, 180, 160);
+
+                    int matsBefore = CVMat.getMatCount();
+                    for (int i = 0; i < 25; i++) {
+                        var result = pipeline.detectInRegion(frame, region);
+                        assertEquals(1, result.output.size(), "cropped region should still find the tag");
+                        var det = result.output.get(0);
+                        assertEquals(
+                                refCx, det.getCenterX(), 3.0, "centre X must be in full-frame coordinates");
+                        assertEquals(
+                                refCy, det.getCenterY(), 3.0, "centre Y must be in full-frame coordinates");
+                    }
+                    assertEquals(matsBefore, CVMat.getMatCount(), "detectInRegion must release every crop");
+
+                    // A region covering the whole frame is a no-op crop (CropPipe returns null); must not
+                    // NPE and must still detect with zero offset.
+                    var whole = pipeline.detectInRegion(frame, new Rect(0, 0, 640, 480));
+                    assertEquals(1, whole.output.size());
+                    assertEquals(refCx, whole.output.get(0).getCenterX(), 3.0);
+                    assertEquals(matsBefore, CVMat.getMatCount());
+
+                    // A region padded past the frame edge (negative origin) is clamped, not rejected.
+                    var overhang = pipeline.detectInRegion(frame, new Rect(-50, -50, 400, 350));
+                    assertTrue(overhang.output.size() >= 1);
+                    assertEquals(matsBefore, CVMat.getMatCount());
+                }
+            }
+        }
+    }
+
+    @Test
+    public void testMlPaddingRestoresQuietZone() {
+        try (var pipeline = new AprilTagPipeline()) {
+            pipeline.getSettings().tagFamily = AprilTagFamily.kTag36h11;
+            pipeline.getSettings().decimate = 1;
+            pipeline.getSettings().mltagEnabled = false;
+
+            try (var frameProvider =
+                    new FileFrameProvider(
+                            TestUtils.getApriltagImagePath(TestUtils.ApriltagTestImages.kTag1_640_480, false),
+                            TestUtils.WPI2020Image.FOV,
+                            TestUtils.get2020LifeCamCoeffs(false))) {
+                frameProvider.requestFrameThresholdType(pipeline.getThresholdType());
+
+                var frame = frameProvider.get();
+                try (CVPipelineResult ref = pipeline.run(frame, QuirkyCamera.DefaultCamera)) {
+                    assertEquals(1, ref.targets.size());
+                    var corners = ref.targets.get(0).getTargetCorners();
+                    double minX = corners.stream().mapToDouble(p -> p.x).min().orElseThrow();
+                    double maxX = corners.stream().mapToDouble(p -> p.x).max().orElseThrow();
+                    double minY = corners.stream().mapToDouble(p -> p.y).min().orElseThrow();
+                    double maxY = corners.stream().mapToDouble(p -> p.y).max().orElseThrow();
+                    double refCx = corners.stream().mapToDouble(p -> p.x).average().orElseThrow();
+                    double refCy = corners.stream().mapToDouble(p -> p.y).average().orElseThrow();
+
+                    // Tight to the tag border — no quiet zone. The detector should miss.
+                    var tight =
+                            new Rect(
+                                    (int) Math.round(minX),
+                                    (int) Math.round(minY),
+                                    (int) Math.round(maxX - minX),
+                                    (int) Math.round(maxY - minY));
+                    var tightResult = pipeline.detectInRegion(frame, tight);
+                    assertEquals(
+                            0, tightResult.output.size(), "a crop with no quiet zone should miss the tag");
+
+                    var padPipe = new PadRectPipe();
+                    padPipe.setParams(0.15);
+                    var padded = padPipe.run(tight).output;
+                    var paddedResult = pipeline.detectInRegion(frame, padded);
+                    assertEquals(
+                            1, paddedResult.output.size(), "default crop padding should restore the quiet zone");
+                    assertEquals(
+                            refCx,
+                            paddedResult.output.get(0).getCenterX(),
+                            3.0,
+                            "centre X must be in full-frame coordinates");
+                    assertEquals(
+                            refCy,
+                            paddedResult.output.get(0).getCenterY(),
+                            3.0,
+                            "centre Y must be in full-frame coordinates");
                 }
             }
         }

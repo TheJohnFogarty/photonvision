@@ -93,7 +93,7 @@ public class HardwareManager {
                     }
                 };
 
-        statusLED = hardwareConfig.statusLEDConfig.map(it -> it.create(lazyDeviceFactory.get()));
+        statusLED = createStatusLED(hardwareConfig.statusLEDConfig, lazyDeviceFactory);
 
         var hasBrightnessRange = hardwareConfig.ledBrightnessRange.size() == 2;
         visionLED =
@@ -256,5 +256,33 @@ public class HardwareManager {
             }
         }
         statusLED.ifPresent(statusLED -> statusLED.setStatus(status));
+    }
+
+    private Optional<StatusLED> createStatusLED(
+            Optional<StatusLedConfig> config, Supplier<NativeDeviceFactoryInterface> deviceFactory) {
+        return config
+                .filter(HardwareManager::hasValidStatusLedPins)
+                .map(
+                        it -> {
+                            try {
+                                return it.create(deviceFactory.get());
+                            } catch (RuntimeException e) {
+                                logger.error("Failed to initialize status LED; continuing without it", e);
+                                return null;
+                            }
+                        });
+    }
+
+    private static boolean hasValidStatusLedPins(StatusLedConfig config) {
+        int[] pins = config.pins();
+        if (pins == null || pins.length == 0) {
+            return false;
+        }
+        for (int pin : pins) {
+            if (pin < 0) {
+                return false;
+            }
+        }
+        return true;
     }
 }

@@ -10,6 +10,9 @@ import type {
   WebsocketPipelineResultUpdate
 } from "@/types/WebsocketDataTypes";
 
+/** Upper bound on log lines kept in memory; a backend log flood must not grow the store unbounded. */
+const MAX_LOG_MESSAGES = 5000;
+
 export interface NTConnectionStatus {
   connected: boolean;
   address?: string;
@@ -126,6 +129,9 @@ export const useStateStore = defineStore("state", {
         message: data.logMessage.logMessage,
         timestamp: new Date()
       });
+      if (this.logMessages.length > MAX_LOG_MESSAGES) {
+        this.logMessages.splice(0, this.logMessages.length - MAX_LOG_MESSAGES);
+      }
     },
     updateNTConnectionStatusFromWebsocket(data: WebsocketNTUpdate) {
       this.ntConnectionStatus = {

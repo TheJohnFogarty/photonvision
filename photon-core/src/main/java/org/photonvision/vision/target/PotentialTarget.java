@@ -19,6 +19,8 @@ package org.photonvision.vision.target;
 
 import java.util.ArrayList;
 import java.util.List;
+import org.opencv.core.Rect;
+import org.opencv.core.Rect2d;
 import org.opencv.core.RotatedRect;
 import org.photonvision.vision.opencv.CVShape;
 import org.photonvision.vision.opencv.Contour;
@@ -57,6 +59,22 @@ public class PotentialTarget implements Releasable {
 
     public PotentialTarget(NeuralNetworkPipeResult det) {
         this.shape = new CVShape(new Contour(det.bbox()), ContourShape.Quadrilateral);
+        this.m_mainContour = this.shape.getContour();
+        m_subContours = List.of();
+        this.clsId = det.classIdx();
+        this.confidence = det.confidence();
+    }
+
+    /**
+     * Like {@link #PotentialTarget(NeuralNetworkPipeResult)}, but the drawn contour is {@code region}
+     * rather than the model's raw box. Used by ML-assisted AprilTag detection to overlay the padded
+     * crop that the detector actually searched.
+     */
+    public PotentialTarget(NeuralNetworkPipeResult det, Rect region) {
+        this.shape =
+                new CVShape(
+                        new Contour(new Rect2d(region.x, region.y, region.width, region.height)),
+                        ContourShape.Quadrilateral);
         this.m_mainContour = this.shape.getContour();
         m_subContours = List.of();
         this.clsId = det.classIdx();

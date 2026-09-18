@@ -91,11 +91,29 @@ public class HardwareConfig {
         vendorFOV = -1;
     }
 
+    // MIGRATION: 2026 — apply after both legacy fields are seen so JSON key
+    // order cannot create an RGB LED with the default pin value of -1.
+    @Json.Ignore private List<Integer> importedStatusRGBPins;
+    @Json.Ignore private Boolean importedStatusRGBActiveHigh;
+
     // MIGRATION: 2026
     @Json.Property("statusRGBPins")
     void importStatusRGBPins(List<Integer> statusRGBPins) {
-        if (statusRGBPins.size() < 3) {
-            // Missing pins are unsupported
+        importedStatusRGBPins = statusRGBPins;
+        applyLegacyStatusRgb();
+    }
+
+    // MIGRATION: 2026
+    @Json.Property("statusRGBActiveHigh")
+    void importStatusRGBActiveHigh(boolean statusRGBActiveHigh) {
+        importedStatusRGBActiveHigh = statusRGBActiveHigh;
+        applyLegacyStatusRgb();
+    }
+
+    private void applyLegacyStatusRgb() {
+        if (importedStatusRGBPins == null || importedStatusRGBPins.size() < 3) {
+            // Missing pins are unsupported. Do not invent an RGB LED from
+            // statusRGBActiveHigh alone — RGBStatusLED.Config defaults to pin -1.
             return;
         }
         if (statusLEDConfig.isEmpty()) {
@@ -103,21 +121,12 @@ public class HardwareConfig {
         }
         if (statusLEDConfig.get() instanceof RGBStatusLED.Config) {
             var config = (RGBStatusLED.Config) statusLEDConfig.get();
-            config.redPin = statusRGBPins.get(0);
-            config.greenPin = statusRGBPins.get(1);
-            config.bluePin = statusRGBPins.get(2);
-        }
-    }
-
-    // MIGRATION: 2026
-    @Json.Property("statusRGBActiveHigh")
-    void importStatusRGBActiveHigh(boolean statusRGBActiveHigh) {
-        if (statusLEDConfig.isEmpty()) {
-            statusLEDConfig = Optional.of(new RGBStatusLED.Config());
-        }
-        if (statusLEDConfig.get() instanceof RGBStatusLED.Config) {
-            var config = (RGBStatusLED.Config) statusLEDConfig.get();
-            config.activeHigh = statusRGBActiveHigh;
+            config.redPin = importedStatusRGBPins.get(0);
+            config.greenPin = importedStatusRGBPins.get(1);
+            config.bluePin = importedStatusRGBPins.get(2);
+            if (importedStatusRGBActiveHigh != null) {
+                config.activeHigh = importedStatusRGBActiveHigh;
+            }
         }
     }
 

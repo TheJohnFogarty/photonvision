@@ -20,6 +20,7 @@ package org.photonvision.vision.pipeline;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import org.opencv.core.Rect;
 import org.photonvision.common.configuration.ConfigManager;
 import org.photonvision.common.configuration.NeuralNetworkModelManager;
 import org.photonvision.common.dataflow.structures.Packet;
@@ -33,6 +34,7 @@ import org.photonvision.vision.frame.Frame;
 import org.photonvision.vision.frame.FrameThresholdType;
 import org.photonvision.vision.objects.Model;
 import org.photonvision.vision.objects.NullModel;
+import org.photonvision.vision.opencv.CVMat;
 import org.photonvision.vision.opencv.DualOffsetValues;
 import org.photonvision.vision.pipe.CVPipe.CVPipeResult;
 import org.photonvision.vision.pipe.impl.AprilTagDetectionPipe;
@@ -44,7 +46,6 @@ import org.photonvision.vision.pipe.impl.Collect2dTargetsPipe;
 import org.photonvision.vision.pipe.impl.CropPipe;
 import org.photonvision.vision.pipe.impl.MultiTargetPNPPipe;
 import org.photonvision.vision.pipe.impl.MultiTargetPNPPipe.MultiTargetPNPPipeParams;
-import org.photonvision.vision.pipe.impl.NeuralNetworkPipeResult;
 import org.photonvision.vision.pipe.impl.ObjectDetectionPipe;
 import org.photonvision.vision.pipe.impl.ObjectDetectionPipe.ObjectDetectionPipeParams;
 import org.photonvision.vision.pipe.impl.PadRectPipe;
@@ -192,48 +193,38 @@ public class AprilTagPipeline extends CVPipeline<CVPipelineResult, AprilTagPipel
         }
 
         List<AprilTagDetection> detections = new ArrayList<>();
-        List<NeuralNetworkPipeResult> mlDetections = List.of();
+        List<PotentialTarget> mlRegions = List.of();
         boolean mltagNoneFound = true;
         if (settings.mltagEnabled) {
             var odResults = objectDetectionPipe.run(frame.colorImage);
             sumPipeNanosElapsed += odResults.nanosElapsed;
-            mlDetections = odResults.output;
-            var inputMat = frame.processedImage.getMat();
-            for (var result : mlDetections) {
+
+            int imageCols = frame.processedImage.getMat().cols();
+            int imageRows = frame.processedImage.getMat().rows();
+            mlRegions = new ArrayList<>(odResults.output.size());
+
+            for (var result : odResults.output) {
                 var paddedResult = padRectPipe.run(result.bbox().boundingRect());
                 sumPipeNanosElapsed += paddedResult.nanosElapsed;
 
-                cropPipe.setParams(new CropPipe.CropPipeParams(paddedResult.output, settings));
-                var cropped = cropPipe.run(frame.processedImage);
-                sumPipeNanosElapsed += cropped.nanosElapsed;
+                var regionResult = detectInRegion(frame, paddedResult.output);
+                sumPipeNanosElapsed += regionResult.nanosElapsed;
 
-                CVPipeResult<List<AprilTagDetection>> tagDetectionPipeResult =
-                        aprilTagDetectionPipe.run(cropped.output);
-                sumPipeNanosElapsed += tagDetectionPipeResult.nanosElapsed;
-
-                var cropRect = cropPipe.effectiveCrop(inputMat.cols(), inputMat.rows());
-                double offsetX = cropRect != null ? cropRect.x : 0;
-                double offsetY = cropRect != null ? cropRect.y : 0;
-                for (var tagDetection : tagDetectionPipeResult.output) {
-                    var corners = tagDetection.getCorners();
-                    var newCorners = new double[8];
-                    for (var i = 0; i < corners.length; i += 2) {
-                        newCorners[i] = corners[i] + offsetX;
-                        newCorners[i + 1] = corners[i + 1] + offsetY;
-                    }
-
-                    detections.add(
-                            new AprilTagDetection(
-                                    tagDetection.getFamily(),
-                                    tagDetection.getId(),
-                                    tagDetection.getHamming(),
-                                    tagDetection.getDecisionMargin(),
-                                    tagDetection.getHomography(),
-                                    tagDetection.getCenterX() + offsetX,
-                                    tagDetection.getCenterY() + offsetY,
-                                    newCorners));
+                if (!regionResult.output.isEmpty()) {
+                    detections.addAll(regionResult.output);
                     mltagNoneFound = false;
                 }
+
+                // Overlay the crop the detector searched (padded, tile-aligned, clamped), not the
+                // model's raw box, so the Crop Padding slider is visible on the output stream.
+                var cropRect = cropPipe.effectiveCrop(imageCols, imageRows);
+                if (cropRect == null) {
+                    cropRect = CropPipe.clampCropToImage(paddedResult.output, imageCols, imageRows);
+                    if (cropRect == null) {
+                        cropRect = new Rect(0, 0, imageCols, imageRows);
+                    }
+                }
+                mlRegions.add(new PotentialTarget(result, cropRect));
             }
         }
 
@@ -244,12 +235,10 @@ public class AprilTagPipeline extends CVPipeline<CVPipelineResult, AprilTagPipel
             detections = tagDetectionPipeResult.output;
         }
 
-        // Turn the model's proposed regions into targets the same way the object detection pipeline
-        // does; the output stream pipeline draws them on the output stream
+        // Draw the padded crop regions on the output stream
         List<TrackedTarget> mlROIs = List.of();
-        if (!mlDetections.isEmpty()) {
-            var collectMLROIsResult =
-                    collect2dMLROIsPipe.run(mlDetections.stream().map(PotentialTarget::new).toList());
+        if (!mlRegions.isEmpty()) {
+            var collectMLROIsResult = collect2dMLROIsPipe.run(mlRegions);
             sumPipeNanosElapsed += collectMLROIsResult.nanosElapsed;
             mlROIs = collectMLROIsResult.output;
         }
@@ -363,6 +352,79 @@ public class AprilTagPipeline extends CVPipeline<CVPipelineResult, AprilTagPipel
         return result;
     }
 
+    /**
+     * Runs the AprilTag detector on one region of the processed (greyscale) image and returns the
+     * detections translated back into full-frame coordinates.
+     *
+     * <p>The crop pipe hands back a fresh {@link CVMat} view for every non-trivial region; it is
+     * released here, every time, so per-detection crops cannot leak native memory. When the region is
+     * a no-op crop (null, degenerate, or covering the whole image) the detector runs on the full
+     * frame with no offset.
+     *
+     * @param frame The frame whose {@code processedImage} is searched.
+     * @param region The padded region to search, in frame coordinates; may extend outside the frame.
+     * @return Detections in full-frame coordinates plus the time spent cropping and detecting.
+     */
+    CVPipeResult<List<AprilTagDetection>> detectInRegion(Frame frame, Rect region) {
+        var out = new CVPipeResult<List<AprilTagDetection>>();
+        long nanos = 0L;
+
+        cropPipe.setParams(new CropPipe.CropPipeParams(region, settings));
+        var cropped = cropPipe.run(frame.processedImage);
+        nanos += cropped.nanosElapsed;
+
+        CVMat regionImage = cropped.output;
+        boolean ownsRegionImage = regionImage != null;
+        if (!ownsRegionImage) {
+            // No-op crop: search the whole frame, offsets are zero.
+            regionImage = frame.processedImage;
+        }
+
+        try {
+            var detectResult = aprilTagDetectionPipe.run(regionImage);
+            nanos += detectResult.nanosElapsed;
+
+            double offsetX = 0;
+            double offsetY = 0;
+            if (ownsRegionImage) {
+                var inputMat = frame.processedImage.getMat();
+                var cropRect = cropPipe.effectiveCrop(inputMat.cols(), inputMat.rows());
+                if (cropRect != null) {
+                    offsetX = cropRect.x;
+                    offsetY = cropRect.y;
+                }
+            }
+
+            var translated = new ArrayList<AprilTagDetection>(detectResult.output.size());
+            for (var tagDetection : detectResult.output) {
+                var corners = tagDetection.getCorners();
+                var newCorners = new double[8];
+                for (var i = 0; i < corners.length; i += 2) {
+                    newCorners[i] = corners[i] + offsetX;
+                    newCorners[i + 1] = corners[i + 1] + offsetY;
+                }
+                translated.add(
+                        new AprilTagDetection(
+                                tagDetection.getFamily(),
+                                tagDetection.getId(),
+                                tagDetection.getHamming(),
+                                tagDetection.getDecisionMargin(),
+                                tagDetection.getHomography(),
+                                tagDetection.getCenterX() + offsetX,
+                                tagDetection.getCenterY() + offsetY,
+                                newCorners));
+            }
+            out.output = translated;
+        } finally {
+            if (ownsRegionImage) {
+                regionImage.release();
+            }
+        }
+
+        out.nanosElapsed = nanos;
+        return out;
+    }
+
     @Override
     public void release() {
         aprilTagDetectionPipe.release();
@@ -371,6 +433,7 @@ public class AprilTagPipeline extends CVPipeline<CVPipelineResult, AprilTagPipel
         calculateFPSPipe.release();
         objectDetectionPipe.release();
         cropPipe.release();
+        padRectPipe.release();
         collect2dMLROIsPipe.release();
         super.release();
     }

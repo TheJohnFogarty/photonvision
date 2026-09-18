@@ -76,9 +76,9 @@ public class AprilTagPipelineSettings extends AdvancedPipelineSettings {
         result = prime * result + (doMultiTarget ? 1231 : 1237);
         result = prime * result + (doSingleTargetAlways ? 1231 : 1237);
         result = prime * result + (mltagEnabled ? 1231 : 1237);
-        result = prime * result + (int) Math.round(mlConfidence);
-        result = prime * result + (int) Math.round(mlNms);
-        result = prime * result + (int) Math.round(mlPadding);
+        result = prime * result + Double.hashCode(mlConfidence);
+        result = prime * result + Double.hashCode(mlNms);
+        result = prime * result + Double.hashCode(mlPadding);
         result = prime * result + Objects.hashCode(tagModel);
         return result;
     }
