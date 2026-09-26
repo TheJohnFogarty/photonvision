@@ -76,6 +76,9 @@ public class CropPipeTest {
         public void requestFrameThresholdType(FrameThresholdType type) {}
 
         @Override
+        public void requestGrayscaleInput(boolean grayscaleInput) {}
+
+        @Override
         public void requestFrameRotation(ImageRotationMode rotationMode) {}
 
         @Override
