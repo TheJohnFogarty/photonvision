@@ -27,6 +27,9 @@
 
 // from wpilib, licensed under the wpilib BSD license
 using namespace wpi::util::java;
+static JException videoEx;
+static const JExceptionInit exceptions[] = {
+    {"edu/wpi/first/cscore/VideoException", &videoEx}};
 static void ReportError(JNIEnv* env, CS_Status status) {
   if (status == CS_OK) {
     return;
@@ -70,16 +73,7 @@ static void ReportError(JNIEnv* env, CS_Status status) {
       break;
     }
   }
-  // Resolved on first use: this library's only JNI_OnLoad is in
-  // TimeSyncClientJNI.cpp. Throwing through an unresolved class would crash the
-  // JVM instead of raising an exception.
-  static JException videoEx(env, "org/wpilib/vision/camera/VideoException");
-  if (videoEx) {
-    videoEx.Throw(env, msg);
-  } else {
-    // Clear FindClass's NoClassDefFoundError; callers treat 0 as an error
-    env->ExceptionClear();
-  }
+  videoEx.Throw(env, msg);
 }
 static inline bool CheckStatus(JNIEnv* env, CS_Status status) {
   if (status != CS_OK) {
