@@ -17,6 +17,7 @@
 
 package org.photonvision.vision.processes;
 
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
 import java.util.ArrayList;
@@ -29,6 +30,14 @@ import org.photonvision.vision.pipeline.DriverModePipelineSettings;
 import org.photonvision.vision.pipeline.PipelineType;
 
 public class PipelineManagerTest {
+    @Test
+    public void closesWithoutCreatingAUserPipeline() {
+        var manager =
+                new PipelineManager(
+                        new DriverModePipelineSettings(), List.of(), PipelineManager.DRIVERMODE_INDEX);
+        assertDoesNotThrow(manager::close);
+    }
+
     @BeforeAll
     public static void init() {
         LoadJNI.loadLibraries();

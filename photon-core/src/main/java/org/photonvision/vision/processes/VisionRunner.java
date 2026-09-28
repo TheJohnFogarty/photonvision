@@ -53,7 +53,7 @@ public class VisionRunner implements AutoCloseable {
     private final FrameProvider frameSupplier;
     private final Supplier<CVPipeline> pipelineSupplier;
     private final Consumer<CVPipelineResult> pipelineResultConsumer;
-    private final VisionModuleChangeSubscriber changeSubscriber;
+    private final Runnable processSettingChanges;
     private final List<Runnable> runnableList = new ArrayList<Runnable>();
     private final QuirkyCamera cameraQuirks;
     private final Supplier<Integer> fpsLimitSupplier;
@@ -75,8 +75,7 @@ public class VisionRunner implements AutoCloseable {
      * @param pipelineSupplier
      * @param pipelineResultConsumer
      * @param cameraQuirks
-     * @param changeSubscriber The subscriber to setting changes for this VisionRunner, so it can
-     *     update its settings when they change.
+     * @param processSettingChanges Applies pending setting changes for this VisionRunner.
      * @param fpsLimitSupplier
      * @param enabledSupplier
      */
@@ -85,7 +84,7 @@ public class VisionRunner implements AutoCloseable {
             Supplier<CVPipeline> pipelineSupplier,
             Consumer<CVPipelineResult> pipelineResultConsumer,
             QuirkyCamera cameraQuirks,
-            VisionModuleChangeSubscriber changeSubscriber,
+            Runnable processSettingChanges,
             Supplier<Integer> fpsLimitSupplier,
             Supplier<Boolean> enabledSupplier,
             Supplier<Boolean> inputStreamConsumedSupplier) {
@@ -93,11 +92,17 @@ public class VisionRunner implements AutoCloseable {
         this.pipelineSupplier = pipelineSupplier;
         this.pipelineResultConsumer = pipelineResultConsumer;
         this.cameraQuirks = cameraQuirks;
-        this.changeSubscriber = changeSubscriber;
+        this.processSettingChanges = processSettingChanges;
         this.fpsLimitSupplier = fpsLimitSupplier;
         this.enabledSupplier = enabledSupplier;
         this.inputStreamConsumedSupplier = inputStreamConsumedSupplier;
 
+        visionProcessThread = new Thread(this::update);
+        visionProcessThread.setName("VisionRunner - " + frameSupplier.getName());
+        logger = new Logger(VisionRunner.class, frameSupplier.getName(), LogGroup.VisionModule);
+        processSettingChanges.run();
+
+        // Allocate last so a failure during initialization cannot strand the alert identifier.
         croppedRawStreamAlert =
                 new Alert(
                         "PhotonAlerts",
@@ -106,12 +111,6 @@ public class VisionRunner implements AutoCloseable {
                                 + frameSupplier.getName()
                                 + " -- extra processing is used to compose the uncropped preview",
                         Level.MEDIUM);
-        croppedRawStreamAlert.set(false);
-
-        visionProcessThread = new Thread(this::update);
-        visionProcessThread.setName("VisionRunner - " + frameSupplier.getName());
-        logger = new Logger(VisionRunner.class, frameSupplier.getName(), LogGroup.VisionModule);
-        changeSubscriber.processSettingChanges();
     }
 
     static boolean configureFrameProviderForPipeline(
@@ -158,13 +157,17 @@ public class VisionRunner implements AutoCloseable {
     }
 
     public void stopProcess() {
-        try {
-            System.out.println("Interrupting vision process thread");
-            visionProcessThread.interrupt();
-            visionProcessThread.join();
-        } catch (InterruptedException e) {
-            logger.error("Exception killing process thread", e);
+        visionProcessThread.interrupt();
+        boolean interrupted = false;
+        while (visionProcessThread.isAlive()) {
+            try {
+                visionProcessThread.join();
+            } catch (InterruptedException e) {
+                // Resource owners must not close camera/frame handles until this thread has exited.
+                interrupted = true;
+            }
         }
+        if (interrupted) Thread.currentThread().interrupt();
     }
 
     public boolean isRunning() {
@@ -219,6 +222,7 @@ public class VisionRunner implements AutoCloseable {
                 try {
                     Thread.sleep(sleepTime);
                 } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
                 }
             }
             return;
@@ -241,7 +245,7 @@ public class VisionRunner implements AutoCloseable {
 
     private void update() {
         // wait for the camera to connect
-        while (!frameSupplier.isConnected() && !Thread.interrupted()) {
+        while (!frameSupplier.isConnected() && !Thread.currentThread().isInterrupted()) {
             // yield
             pipelineResultConsumer.accept(new CVPipelineResult(0l, 0, 0, null, new Frame()));
             try {
@@ -250,6 +254,7 @@ public class VisionRunner implements AutoCloseable {
                 return;
             }
         }
+        if (Thread.currentThread().isInterrupted()) return;
 
         DataChangeService.getInstance()
                 .publishEvent(
@@ -259,7 +264,7 @@ public class VisionRunner implements AutoCloseable {
 
         while (!Thread.interrupted()) {
             long start = System.currentTimeMillis();
-            changeSubscriber.processSettingChanges();
+            processSettingChanges.run();
             synchronized (runnableList) {
                 for (var runnable : runnableList) {
                     try {
@@ -287,8 +292,14 @@ public class VisionRunner implements AutoCloseable {
             if (isCroppablePipeline) {
                 // The dimmed full-frame context image exists only for the input stream's viewers --
                 // skip composing it when nothing is actually consuming that stream.
-                keepContext = pipeline.getSettings().inputShouldShow && inputStreamConsumedSupplier.get();
-                frame = frameSupplier.cropFrame(frame, keepContext);
+                try {
+                    keepContext = pipeline.getSettings().inputShouldShow && inputStreamConsumedSupplier.get();
+                    frame = frameSupplier.cropFrame(frame, keepContext);
+                } catch (Exception ex) {
+                    logger.error("Frame cropping exception on loop " + loopCount, ex);
+                    frame.release();
+                    continue;
+                }
             }
             updateCroppedRawStreamAlert(keepContext);
 
@@ -330,6 +341,9 @@ public class VisionRunner implements AutoCloseable {
                     frame.release();
                 }
                 loopCount++;
+            } else {
+                // A pipeline change invalidates this frame's preprocessing settings.
+                frame.release();
             }
         }
     }
@@ -339,5 +353,6 @@ public class VisionRunner implements AutoCloseable {
         if (visionProcessThread.isAlive()) {
             stopProcess();
         }
+        croppedRawStreamAlert.close();
     }
 }

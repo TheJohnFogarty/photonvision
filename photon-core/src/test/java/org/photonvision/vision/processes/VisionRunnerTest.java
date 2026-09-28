@@ -18,25 +18,188 @@
 package org.photonvision.vision.processes;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Supplier;
 import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Test;
 import org.junitpioneer.jupiter.cartesian.CartesianTest;
 import org.junitpioneer.jupiter.cartesian.CartesianTest.Enum;
 import org.junitpioneer.jupiter.cartesian.CartesianTest.Values;
+import org.opencv.core.CvType;
+import org.opencv.core.Rect;
 import org.photonvision.common.LoadJNI;
+import org.photonvision.common.configuration.ConfigManager;
+import org.photonvision.common.util.numbers.IntegerCouple;
+import org.photonvision.jni.LibraryLoader;
+import org.photonvision.vision.camera.QuirkyCamera;
 import org.photonvision.vision.frame.Frame;
 import org.photonvision.vision.frame.FrameProvider;
+import org.photonvision.vision.frame.FrameStaticProperties;
 import org.photonvision.vision.frame.FrameThresholdType;
+import org.photonvision.vision.opencv.CVMat;
 import org.photonvision.vision.opencv.ImageRotationMode;
 import org.photonvision.vision.pipe.impl.HSVPipe;
 import org.photonvision.vision.pipeline.*;
 import org.photonvision.vision.pipeline.result.CVPipelineResult;
+import org.wpilib.util.Alert;
 
 public class VisionRunnerTest {
     @BeforeAll
     public static void init() {
         LoadJNI.loadLibraries();
+    }
+
+    @Test
+    public void failedInitializationDoesNotAllocateAlert() {
+        var provider = new RecordingFrameProvider();
+        var failure =
+                assertThrows(
+                        IllegalStateException.class,
+                        () ->
+                                new VisionRunner(
+                                        provider,
+                                        () -> null,
+                                        result -> {},
+                                        QuirkyCamera.DefaultCamera,
+                                        () -> {
+                                            throw new IllegalStateException("injected settings failure");
+                                        },
+                                        () -> -1,
+                                        () -> true,
+                                        () -> false));
+        assertEquals("injected settings failure", failure.getMessage());
+        // Failed settings initialization must leave the alert ID available.
+        try (var replacement =
+                new Alert("PhotonAlerts", provider.getName(), "replacement", Alert.Level.MEDIUM)) {
+            replacement.set(false);
+        }
+    }
+
+    @Test
+    public void closeReleasesAlertForSameCamera() {
+        var provider = new RecordingFrameProvider();
+        for (int attempt = 0; attempt < 3; attempt++) {
+            try (var runner =
+                    new VisionRunner(
+                            provider,
+                            () -> null,
+                            result -> {},
+                            QuirkyCamera.DefaultCamera,
+                            () -> {},
+                            () -> -1,
+                            () -> true,
+                            () -> false)) {
+                runner.close();
+                // Closing must release the exact identifier, not merely deactivate the alert.
+                try (var replacement =
+                        new Alert("PhotonAlerts", provider.getName(), "replacement", Alert.Level.MEDIUM)) {
+                    replacement.set(false);
+                }
+            }
+        }
+    }
+
+    private static Frame observedFrame(CountDownLatch released) {
+        return observedFrame(released, new FrameStaticProperties(64, 64, 70, null));
+    }
+
+    private static Frame observedFrame(CountDownLatch released, FrameStaticProperties properties) {
+        var frame =
+                new Frame(-1, new CVMat(), new CVMat(), FrameThresholdType.NONE, 0, properties) {
+                    @Override
+                    public void release() {
+                        super.release();
+                        released.countDown();
+                    }
+                };
+        frame.processedImage.getMat().create(64, 64, CvType.CV_8UC1);
+        return frame;
+    }
+
+    @Test
+    public void pipelineChangeReleasesCapturedFrame() throws InterruptedException {
+        assumeTrue(LibraryLoader.loadTargeting(), "Running the vision loop requires TimeSync JNI");
+        ConfigManager.getInstance().load();
+        var released = new CountDownLatch(1);
+        var frame = observedFrame(released);
+        var provider =
+                new RecordingFrameProvider() {
+                    @Override
+                    public Frame get() {
+                        Thread.currentThread().interrupt(); // One iteration is enough for this ownership check.
+                        return frame;
+                    }
+                };
+        var reads = new AtomicInteger();
+        try (var first = new ObjectDetectionStubPipeline();
+                var second = new ObjectDetectionStubPipeline();
+                var runner =
+                        new VisionRunner(
+                                provider,
+                                () -> reads.getAndIncrement() == 0 ? first : second,
+                                CVPipelineResult::release,
+                                QuirkyCamera.DefaultCamera,
+                                () -> {},
+                                () -> -1,
+                                () -> true,
+                                () -> false)) {
+            runner.startProcess();
+            assertTrue(released.await(5, TimeUnit.SECONDS), "Discarded frame must be released");
+        } finally {
+            frame.release();
+        }
+    }
+
+    @Test
+    public void cropFailureReleasesFrameAndContinues() throws InterruptedException {
+        assumeTrue(LibraryLoader.loadTargeting(), "Running the vision loop requires TimeSync JNI");
+        ConfigManager.getInstance().load();
+        var released = new CountDownLatch(2);
+        var properties =
+                new FrameStaticProperties(64, 64, 70, null) {
+                    @Override
+                    public FrameStaticProperties crop(Rect cropRect) {
+                        throw new IllegalArgumentException("injected crop failure");
+                    }
+                };
+        var frames =
+                java.util.List.of(observedFrame(released, properties), observedFrame(released, properties));
+        var captures = new AtomicInteger();
+        var provider =
+                new RecordingFrameProvider() {
+                    @Override
+                    public Frame get() {
+                        int capture = captures.incrementAndGet();
+                        if (capture == 2) Thread.currentThread().interrupt();
+                        return frames.get(capture - 1);
+                    }
+                };
+        var pipeline = new ObjectDetectionStubPipeline();
+        pipeline.getSettings().staticCropX = new IntegerCouple(0, 16);
+        pipeline.getSettings().staticCropY = new IntegerCouple(0, 16);
+        try (pipeline;
+                var runner =
+                        new VisionRunner(
+                                provider,
+                                () -> pipeline,
+                                CVPipelineResult::release,
+                                QuirkyCamera.DefaultCamera,
+                                () -> {},
+                                () -> -1,
+                                () -> true,
+                                () -> false)) {
+            runner.startProcess();
+            assertTrue(released.await(5, TimeUnit.SECONDS), "Both failed frames must be released");
+            assertEquals(2, captures.get(), "A crop failure must not kill the vision loop");
+        } finally {
+            frames.forEach(Frame::release);
+        }
     }
 
     /**

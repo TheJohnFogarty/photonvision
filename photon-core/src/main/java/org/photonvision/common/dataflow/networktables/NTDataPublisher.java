@@ -35,7 +35,7 @@ import org.wpilib.networktables.NetworkTable;
 import org.wpilib.networktables.NetworkTableEvent;
 import org.wpilib.networktables.NetworkTablesJNI;
 
-public class NTDataPublisher implements CVPipelineResultConsumer {
+public class NTDataPublisher implements CVPipelineResultConsumer, AutoCloseable {
     private final Logger logger = new Logger(NTDataPublisher.class, LogGroup.General);
 
     private final NetworkTable rootTable = NetworkTablesManager.getInstance().kRootTable;
@@ -78,7 +78,6 @@ public class NTDataPublisher implements CVPipelineResultConsumer {
         this.isEnabledConsumer = isEnabledConsumer;
 
         updateCameraNickname(cameraNickname);
-        updateEntries();
     }
 
     private void onPipelineIndexChange(NetworkTableEvent entryNotification) {
@@ -147,6 +146,8 @@ public class NTDataPublisher implements CVPipelineResultConsumer {
     private void removeEntries() {
         if (pipelineIndexListener != null) pipelineIndexListener.remove();
         if (driverModeListener != null) driverModeListener.remove();
+        if (fpsLimitListener != null) fpsLimitListener.remove();
+        if (isEnabledListener != null) isEnabledListener.remove();
         ts.removeEntries();
     }
 
@@ -154,6 +155,7 @@ public class NTDataPublisher implements CVPipelineResultConsumer {
         if (pipelineIndexListener != null) pipelineIndexListener.remove();
         if (driverModeListener != null) driverModeListener.remove();
         if (fpsLimitListener != null) fpsLimitListener.remove();
+        if (isEnabledListener != null) isEnabledListener.remove();
 
         ts.updateEntries();
 
@@ -178,6 +180,11 @@ public class NTDataPublisher implements CVPipelineResultConsumer {
         removeEntries();
         ts.subTable = rootTable.getSubTable(newCameraNickname);
         updateEntries();
+    }
+
+    @Override
+    public void close() {
+        removeEntries();
     }
 
     @Override

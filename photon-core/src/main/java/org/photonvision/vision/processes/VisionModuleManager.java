@@ -50,11 +50,28 @@ public class VisionModuleManager implements AutoCloseable {
             VisionSource visionSource, Collection<CVPipelineResultConsumer> consumers) {
         visionSource.cameraConfiguration.streamIndex = newCameraIndex();
 
-        var pipelineManager = new PipelineManager(visionSource.getCameraConfiguration());
-        var module = new VisionModule(pipelineManager, visionSource, consumers);
-        visionModules.add(module);
-
-        return module;
+        // The manager owns the source until a fully initialized module takes ownership.
+        PipelineManager pipelineManager = null;
+        try {
+            pipelineManager = new PipelineManager(visionSource.getCameraConfiguration());
+            var module = new VisionModule(pipelineManager, visionSource, consumers);
+            visionModules.add(module);
+            return module;
+        } catch (RuntimeException | Error failure) {
+            if (pipelineManager != null) {
+                try {
+                    pipelineManager.close();
+                } catch (RuntimeException | Error cleanupFailure) {
+                    failure.addSuppressed(cleanupFailure);
+                }
+            }
+            try {
+                visionSource.close();
+            } catch (RuntimeException | Error cleanupFailure) {
+                failure.addSuppressed(cleanupFailure);
+            }
+            throw failure;
+        }
     }
 
     public synchronized CameraConfiguration removeModule(VisionModule module) {

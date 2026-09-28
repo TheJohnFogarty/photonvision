@@ -18,6 +18,7 @@
 package org.photonvision.vision.processes;
 
 import io.javalin.websocket.WsContext;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
@@ -90,6 +91,7 @@ public class VisionModule implements AutoCloseable {
 
     private int fpsLimit = -1;
     private boolean enabled = true;
+    private boolean closed = false;
 
     FileSaveFrameConsumer inputFrameSaver;
     FileSaveFrameConsumer outputFrameSaver;
@@ -135,73 +137,92 @@ public class VisionModule implements AutoCloseable {
         this.pipelineManager = pipelineManager;
         this.visionSource = visionSource;
         changeSubscriber = new VisionModuleChangeSubscriber(this);
-        this.visionRunner =
-                new VisionRunner(
-                        this.visionSource.getFrameProvider(),
-                        this.pipelineManager::getCurrentPipeline,
-                        this::consumeResult,
-                        this.cameraQuirks,
-                        getChangeSubscriber(),
-                        this::getFPSLimit,
-                        this::getEnabled,
-                        // Streams are created after the runner, so read the field lazily
-                        () -> inputVideoStreamer != null && inputVideoStreamer.isStreamConsumed());
-        this.streamRunnable = new StreamRunnable(new OutputStreamPipeline());
-        changeSubscriberHandle = DataChangeService.getInstance().addSubscriber(changeSubscriber);
+        // Until construction succeeds, release each resource in reverse acquisition order.
+        var cleanup = new ArrayDeque<Runnable>();
+        try {
+            this.visionRunner =
+                    new VisionRunner(
+                            this.visionSource.getFrameProvider(),
+                            this.pipelineManager::getCurrentPipeline,
+                            this::consumeResult,
+                            this.cameraQuirks,
+                            getChangeSubscriber()::processSettingChanges,
+                            this::getFPSLimit,
+                            this::getEnabled,
+                            // Streams are created after the runner, so read the field lazily
+                            () -> inputVideoStreamer != null && inputVideoStreamer.isStreamConsumed());
+            cleanup.push(visionRunner::close);
+            this.streamRunnable = new StreamRunnable(new OutputStreamPipeline());
+            cleanup.push(streamRunnable::release);
+            changeSubscriberHandle = DataChangeService.getInstance().addSubscriber(changeSubscriber);
+            cleanup.push(changeSubscriberHandle::stop);
 
-        createStreams();
+            createStreams(cleanup);
 
-        recreateStreamResultConsumers();
+            recreateStreamResultConsumers();
 
-        ntConsumer =
-                new NTDataPublisher(
-                        visionSource.getSettables().getConfiguration().nickname,
-                        pipelineManager::getRequestedIndex,
-                        this::setPipeline,
-                        pipelineManager::getDriverMode,
-                        this::setDriverMode,
-                        this::getFPSLimit,
-                        this::setFPSLimit,
-                        this::getEnabled,
-                        this::setEnabled);
-        uiDataConsumer = new UIDataPublisher(visionSource.getSettables().getConfiguration().uniqueName);
-        statusLEDsConsumer =
-                new StatusLEDConsumer(visionSource.getSettables().getConfiguration().uniqueName);
-        resultConsumers.add(ntConsumer);
-        resultConsumers.add(uiDataConsumer);
-        resultConsumers.add(statusLEDsConsumer);
-        resultConsumers.add(
-                (result) ->
-                        lastPipelineResultBestTarget = result.hasTargets() ? result.targets.get(0) : null);
-        resultConsumers.addAll(extraConsumers);
+            ntConsumer =
+                    new NTDataPublisher(
+                            visionSource.getSettables().getConfiguration().nickname,
+                            pipelineManager::getRequestedIndex,
+                            this::setPipeline,
+                            pipelineManager::getDriverMode,
+                            this::setDriverMode,
+                            this::getFPSLimit,
+                            this::setFPSLimit,
+                            this::getEnabled,
+                            this::setEnabled);
+            cleanup.push(ntConsumer::close);
+            uiDataConsumer =
+                    new UIDataPublisher(visionSource.getSettables().getConfiguration().uniqueName);
+            statusLEDsConsumer =
+                    new StatusLEDConsumer(visionSource.getSettables().getConfiguration().uniqueName);
+            resultConsumers.add(ntConsumer);
+            resultConsumers.add(uiDataConsumer);
+            resultConsumers.add(statusLEDsConsumer);
+            resultConsumers.add(
+                    (result) ->
+                            lastPipelineResultBestTarget = result.hasTargets() ? result.targets.get(0) : null);
+            resultConsumers.addAll(extraConsumers);
 
-        // Sync VisionModule state with the first pipeline index
-        setPipeline(visionSource.getSettables().getConfiguration().currentPipelineIndex);
+            // Sync VisionModule state with the first pipeline index
+            setPipeline(visionSource.getSettables().getConfiguration().currentPipelineIndex);
 
-        // Set vendor FOV
-        if (isVendorCamera()) {
-            var fov = ConfigManager.getInstance().getConfig().getHardwareConfig().vendorFOV;
-            logger.info("Setting FOV of vendor camera to " + fov);
-            visionSource.getSettables().setFOV(fov);
+            // Set vendor FOV
+            if (isVendorCamera()) {
+                var fov = ConfigManager.getInstance().getConfig().getHardwareConfig().vendorFOV;
+                logger.info("Setting FOV of vendor camera to " + fov);
+                visionSource.getSettables().setFOV(fov);
+            }
+
+            // Configure LED's if supported by the underlying hardware.
+            if (this.camShouldControlLEDs()) {
+                HardwareManager.getInstance()
+                        .visionLED
+                        .ifPresent(
+                                (visionLED) ->
+                                        visionLED.setPipelineModeSupplier(
+                                                () -> pipelineManager.getCurrentPipelineSettings().ledMode));
+                setVisionLEDs(pipelineManager.getCurrentPipelineSettings().ledMode);
+            }
+
+            getCameraConfiguration().deactivated = false;
+            saveAndBroadcastAll();
+            cleanup.push(this::stop);
+            start();
+        } catch (RuntimeException | Error failure) {
+            while (!cleanup.isEmpty()) {
+                try {
+                    cleanup.pop().run();
+                } catch (RuntimeException | Error cleanupFailure) {
+                    failure.addSuppressed(cleanupFailure);
+                }
+            }
+            throw failure;
         }
-
-        // Configure LED's if supported by the underlying hardware.
-        if (this.camShouldControlLEDs()) {
-            HardwareManager.getInstance()
-                    .visionLED
-                    .ifPresent(
-                            (visionLED) ->
-                                    visionLED.setPipelineModeSupplier(
-                                            () -> pipelineManager.getCurrentPipelineSettings().ledMode));
-            setVisionLEDs(pipelineManager.getCurrentPipelineSettings().ledMode);
-        }
-
-        getCameraConfiguration().deactivated = false;
-        saveAndBroadcastAll();
-        start();
     }
 
-    private void createStreams() {
+    private void createStreams(ArrayDeque<Runnable> cleanup) {
         var camStreamIdx = visionSource.getSettables().getConfiguration().streamIndex;
         // If idx = 0, we want (1181, 1182)
         this.inputStreamPort = 1181 + (camStreamIdx * 2);
@@ -212,19 +233,23 @@ public class VisionModule implements AutoCloseable {
                         visionSource.getSettables().getConfiguration().nickname,
                         visionSource.getSettables().getConfiguration().uniqueName,
                         "input");
+        cleanup.push(inputFrameSaver::close);
         outputFrameSaver =
                 new FileSaveFrameConsumer(
                         visionSource.getSettables().getConfiguration().nickname,
                         visionSource.getSettables().getConfiguration().uniqueName,
                         "output");
+        cleanup.push(outputFrameSaver::close);
 
         String camHostname = CameraServerJNI.getHostname();
         inputVideoStreamer =
                 new MJPGFrameConsumer(
                         camHostname + "_Port_" + inputStreamPort + "_Input_MJPEG_Server", inputStreamPort);
+        cleanup.push(inputVideoStreamer::close);
         outputVideoStreamer =
                 new MJPGFrameConsumer(
                         camHostname + "_Port_" + outputStreamPort + "_Output_MJPEG_Server", outputStreamPort);
+        cleanup.push(outputVideoStreamer::close);
     }
 
     private void recreateStreamResultConsumers() {
@@ -306,6 +331,8 @@ public class VisionModule implements AutoCloseable {
                     settings = this.settings;
                     targets = this.targets;
                     mlROIs = this.mlROIs;
+                    this.targets = null;
+                    this.mlROIs = null;
                     shouldRun = this.shouldRun;
 
                     this.shouldRun = false;
@@ -341,6 +368,22 @@ public class VisionModule implements AutoCloseable {
                 }
             }
         }
+
+        // Called only after the producer and stream threads have stopped.
+        private void release() {
+            synchronized (frameLock) {
+                if (latestFrame != null) {
+                    latestFrame.release();
+                    latestFrame = null;
+                }
+                if (targets != null) targets.forEach(TrackedTarget::release);
+                if (mlROIs != null) mlROIs.forEach(TrackedTarget::release);
+                targets = null;
+                mlROIs = null;
+                shouldRun = false;
+            }
+            outputStreamPipeline.release();
+        }
     }
 
     private void start() {
@@ -351,12 +394,16 @@ public class VisionModule implements AutoCloseable {
     private void stop() {
         visionRunner.stopProcess();
 
-        try {
-            streamRunnable.interrupt();
-            streamRunnable.join();
-        } catch (InterruptedException e) {
-            logger.error("Exception killing process thread", e);
+        streamRunnable.interrupt();
+        boolean interrupted = false;
+        while (streamRunnable.isAlive()) {
+            try {
+                streamRunnable.join();
+            } catch (InterruptedException e) {
+                interrupted = true;
+            }
         }
+        if (interrupted) Thread.currentThread().interrupt();
     }
 
     public void setFov(double fov) {
@@ -779,25 +826,39 @@ public class VisionModule implements AutoCloseable {
     }
 
     @Override
-    public void close() {
-        if (visionRunner.isRunning()) {
-            stop();
+    public synchronized void close() {
+        if (closed) return;
+        // The stream thread may still be running after the vision thread has failed.
+        stop();
+        closed = true;
+
+        // Saving or releasing one resource must not strand the remaining camera handles.
+        List<Runnable> cleanup =
+                List.of(
+                        this::saveAndBroadcastAll,
+                        streamRunnable::release,
+                        inputVideoStreamer::close,
+                        outputVideoStreamer::close,
+                        inputFrameSaver::close,
+                        outputFrameSaver::close,
+                        changeSubscriberHandle::stop,
+                        ntConsumer::close,
+                        () -> setVisionLEDs(false),
+                        visionRunner::close,
+                        pipelineManager::close,
+                        visionSource::close);
+        Throwable failure = null;
+        for (var closeResource : cleanup) {
+            try {
+                closeResource.run();
+            } catch (RuntimeException | Error cleanupFailure) {
+                if (failure == null) failure = cleanupFailure;
+                else failure.addSuppressed(cleanupFailure);
+            }
         }
-
-        // Ensure config is saved and synced before closing
-        saveAndBroadcastAll();
-
-        inputVideoStreamer.close();
-        outputVideoStreamer.close();
-        inputFrameSaver.close();
-        outputFrameSaver.close();
-
-        changeSubscriberHandle.stop();
-        setVisionLEDs(false);
-
-        visionRunner.close();
-        pipelineManager.close();
-        visionSource.close();
-        if (lastPipelineResultBestTarget != null) lastPipelineResultBestTarget.close();
+        // This is a borrowed reference; the result/stream owns and releases the target.
+        lastPipelineResultBestTarget = null;
+        if (failure instanceof RuntimeException exception) throw exception;
+        if (failure instanceof Error error) throw error;
     }
 }

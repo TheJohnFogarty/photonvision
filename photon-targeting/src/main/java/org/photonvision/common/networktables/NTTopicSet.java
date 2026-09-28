@@ -53,12 +53,15 @@ public class NTTopicSet {
     public BooleanTopic driverModeEntry;
     public BooleanPublisher driverModePublisher;
     public BooleanSubscriber driverModeSubscriber;
+    private BooleanPublisher driverModeRequestPublisher;
 
     public IntegerPublisher fpsLimitPublisher;
     public IntegerSubscriber fpsLimitSubscriber;
+    private IntegerPublisher fpsLimitRequestPublisher;
 
     public BooleanPublisher enabledPublisher;
     public BooleanSubscriber enabledSubscriber;
+    private BooleanPublisher enabledRequestPublisher;
 
     public DoublePublisher latencyMillisEntry;
     public DoublePublisher fpsEntry;
@@ -105,17 +108,20 @@ public class NTTopicSet {
         driverModeSubscriber = subTable.getBooleanTopic("driverModeRequest").subscribe(false);
 
         // Fun little hack to make the request show up
-        driverModeSubscriber.getTopic().publish().setDefault(false);
+        driverModeRequestPublisher = driverModeSubscriber.getTopic().publish();
+        driverModeRequestPublisher.setDefault(false);
 
         fpsLimitPublisher = subTable.getIntegerTopic("fpsLimit").publish();
         fpsLimitSubscriber = subTable.getIntegerTopic("fpsLimitRequest").subscribe(-1);
 
-        fpsLimitSubscriber.getTopic().publish().setDefault(-1);
+        fpsLimitRequestPublisher = fpsLimitSubscriber.getTopic().publish();
+        fpsLimitRequestPublisher.setDefault(-1);
 
         enabledPublisher = subTable.getBooleanTopic("enabled").publish();
         enabledSubscriber = subTable.getBooleanTopic("enabledRequest").subscribe(true);
 
-        enabledSubscriber.getTopic().publish().setDefault(true);
+        enabledRequestPublisher = enabledSubscriber.getTopic().publish();
+        enabledRequestPublisher.setDefault(true);
 
         latencyMillisEntry = subTable.getDoubleTopic("latencyMillis").publish();
         fpsEntry = subTable.getDoubleTopic("fps").publish();
@@ -140,17 +146,21 @@ public class NTTopicSet {
     @SuppressWarnings("DuplicatedCode")
     public void removeEntries() {
         if (resultPublisher != null) resultPublisher.close();
+        if (protoResultPublisher != null) protoResultPublisher.close();
         if (pipelineIndexPublisher != null) pipelineIndexPublisher.close();
         if (pipelineIndexRequestSub != null) pipelineIndexRequestSub.close();
 
         if (driverModePublisher != null) driverModePublisher.close();
         if (driverModeSubscriber != null) driverModeSubscriber.close();
+        if (driverModeRequestPublisher != null) driverModeRequestPublisher.close();
 
         if (fpsLimitPublisher != null) fpsLimitPublisher.close();
         if (fpsLimitSubscriber != null) fpsLimitSubscriber.close();
+        if (fpsLimitRequestPublisher != null) fpsLimitRequestPublisher.close();
 
         if (enabledPublisher != null) enabledPublisher.close();
         if (enabledSubscriber != null) enabledSubscriber.close();
+        if (enabledRequestPublisher != null) enabledRequestPublisher.close();
 
         if (latencyMillisEntry != null) latencyMillisEntry.close();
         if (fpsEntry != null) fpsEntry.close();

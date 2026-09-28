@@ -19,6 +19,7 @@ package org.photonvision.vision.processes;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.avaje.jsonb.Jsonb;
@@ -108,6 +109,45 @@ public class VisionSourceManagerTest {
             var str = Jsonb.instance().type(PVCameraInfo.class).toJson(csi);
             System.out.println(str);
             System.out.println(Jsonb.instance().type(PVCameraInfo.class).fromJson(str));
+        }
+    }
+
+    @Test
+    public void testFailedReactivationKeepsDisabledConfiguration() {
+        try (var manager =
+                new TestVsm() {
+                    @Override
+                    protected VisionSource loadVisionSourceFromCamConfig(CameraConfiguration configuration) {
+                        throw new IllegalStateException("injected source initialization failure");
+                    }
+                }) {
+            var config = new CameraConfiguration(PVCameraInfo.fromFileInfo("disabled", "disabled"));
+            config.deactivated = true;
+            manager.registerLoadedConfigs(List.of(config));
+            assertThrows(
+                    IllegalStateException.class,
+                    () -> manager.reactivateDisabledCameraConfig(config.uniqueName));
+            assertEquals(config, manager.disabledCameraConfigs.get(config.uniqueName));
+            assertTrue(config.deactivated);
+        }
+    }
+
+    @Test
+    public void testDeleteAndReaddCamera() {
+        var camera =
+                PVCameraInfo.fromUsbCameraInfo(
+                        new UsbCameraInfo(
+                                20,
+                                "/dev/video20",
+                                "Lifecycle Camera",
+                                new String[] {"/dev/v4l/by-path/lifecycle-camera"},
+                                0,
+                                0));
+        for (int attempt = 0; attempt < 3; attempt++) {
+            assertTrue(vsm.assignUnmatchedCamera(camera));
+            assertEquals(1, vsm.getVisionModules().size());
+            assertTrue(vsm.deleteVisionSource(vsm.getVisionModules().get(0).uniqueName()));
+            assertTrue(vsm.getVisionModules().isEmpty());
         }
     }
 
