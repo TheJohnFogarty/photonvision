@@ -137,6 +137,7 @@ public class LibcameraGpuFrameProvider extends FrameProvider {
 
     @Override
     public void release() {
+        super.release();
         synchronized (settables.CAMERA_LOCK) {
             LibCameraJNI.stopCamera(settables.r_ptr);
             LibCameraJNI.destroyCamera(settables.r_ptr);

@@ -76,26 +76,39 @@ public class TFLiteObjectDetector implements ObjectDetector {
                             model.properties.version().ordinal(),
                             backend.value());
         } catch (Exception e) {
+            letterboxed.release();
             logger.error("Failed to create detector from path " + model.modelFile.getPath(), e);
             throw new RuntimeException(
                     "Failed to create detector from path " + model.modelFile.getPath(), e);
+        } catch (Error e) {
+            letterboxed.release();
+            throw e;
         }
 
-        if (!isValid()) {
-            logger.error(
-                    "Failed to create detector from path "
-                            + model.modelFile.getPath()
-                            + ". Please ensure the model is valid and compatible with the TFLite backend.");
-            throw new RuntimeException(
-                    "Failed to create detector from path " + model.modelFile.getPath());
-        } else if (!TFLiteJNI.isQuantized(ptr)) {
-            throw new UnsupportedOperationException("Model must be quantized.");
+        try {
+            if (!isValid()) {
+                logger.error(
+                        "Failed to create detector from path "
+                                + model.modelFile.getPath()
+                                + ". Please ensure the model is valid and compatible with the TFLite backend.");
+                throw new RuntimeException(
+                        "Failed to create detector from path " + model.modelFile.getPath());
+            } else if (!TFLiteJNI.isQuantized(ptr)) {
+                throw new UnsupportedOperationException("Model must be quantized.");
+            }
+
+            logger.debug("Created detector for model " + model.modelFile.getName());
+
+            // Only transfer ownership to the cleaner after initialization succeeds.
+            cleanable = cleaner.register(this, cleanupAction(ptr));
+        } catch (RuntimeException | Error e) {
+            try {
+                if (isValid()) TFLiteJNI.destroy(ptr);
+            } finally {
+                letterboxed.release();
+            }
+            throw e;
         }
-
-        logger.debug("Created detector for model " + model.modelFile.getName());
-
-        // Register the cleaner to release the detector when it goes out of scope
-        cleanable = cleaner.register(this, cleanupAction(ptr));
     }
 
     /**

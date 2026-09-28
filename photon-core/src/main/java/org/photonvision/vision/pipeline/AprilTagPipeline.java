@@ -65,12 +65,12 @@ import org.wpilib.vision.apriltag.AprilTagPoseEstimator.Config;
 public class AprilTagPipeline extends CVPipeline<CVPipelineResult, AprilTagPipelineSettings> {
     private static final Logger logger = new Logger(AprilTagPipeline.class, LogGroup.VisionModule);
 
-    private final AprilTagDetectionPipe aprilTagDetectionPipe = new AprilTagDetectionPipe();
+    private final AprilTagDetectionPipe aprilTagDetectionPipe;
     private final AprilTagPoseEstimatorPipe singleTagPoseEstimatorPipe =
             new AprilTagPoseEstimatorPipe();
     private final MultiTargetPNPPipe multiTagPNPPipe = new MultiTargetPNPPipe();
     private final CalculateFPSPipe calculateFPSPipe = new CalculateFPSPipe();
-    private final ObjectDetectionPipe objectDetectionPipe = new ObjectDetectionPipe();
+    private final ObjectDetectionPipe objectDetectionPipe;
     private final CropPipe cropPipe = new CropPipe();
     private final PadRectPipe padRectPipe = new PadRectPipe();
     private final Collect2dTargetsPipe collect2dMLROIsPipe = new Collect2dTargetsPipe();
@@ -80,13 +80,21 @@ public class AprilTagPipeline extends CVPipeline<CVPipelineResult, AprilTagPipel
     private static final int DECIMATE_6_THRESHOLD = 320 * 320;
 
     public AprilTagPipeline() {
-        super(PROCESSING_TYPE);
-        settings = new AprilTagPipelineSettings();
+        this(new AprilTagPipelineSettings());
     }
 
     public AprilTagPipeline(AprilTagPipelineSettings settings) {
+        this(settings, new ObjectDetectionPipe(), new AprilTagDetectionPipe());
+    }
+
+    AprilTagPipeline(
+            AprilTagPipelineSettings settings,
+            ObjectDetectionPipe objectDetectionPipe,
+            AprilTagDetectionPipe aprilTagDetectionPipe) {
         super(PROCESSING_TYPE);
         this.settings = settings;
+        this.objectDetectionPipe = objectDetectionPipe;
+        this.aprilTagDetectionPipe = aprilTagDetectionPipe;
     }
 
     @Override
@@ -212,43 +220,46 @@ public class AprilTagPipeline extends CVPipeline<CVPipelineResult, AprilTagPipel
                     var cropped = cropPipe.run(frame.processedImage);
                     sumPipeNanosElapsed += cropped.nanosElapsed;
 
-                    if (paddedResult.output.width * paddedResult.output.height >= DECIMATE_6_THRESHOLD) {
-                        config.quadDecimate = 6;
-                    } else if (paddedResult.output.width * paddedResult.output.height
-                            >= DECIMATE_3_THRESHOLD) {
-                        config.quadDecimate = 3;
-                    } else {
-                        config.quadDecimate = defaultDecimate;
-                    }
-
-                    aprilTagDetectionPipe.setConfig(config);
-
-                    CVPipeResult<List<AprilTagDetection>> tagDetectionPipeResult =
-                            aprilTagDetectionPipe.run(cropped.output);
-                    sumPipeNanosElapsed += tagDetectionPipeResult.nanosElapsed;
-
-                    var cropRect = cropPipe.effectiveCrop(inputMat.cols(), inputMat.rows());
-                    double offsetX = cropRect != null ? cropRect.x : 0;
-                    double offsetY = cropRect != null ? cropRect.y : 0;
-                    for (var tagDetection : tagDetectionPipeResult.output) {
-                        var corners = tagDetection.getCorners();
-                        var newCorners = new double[8];
-                        for (var i = 0; i < corners.length; i += 2) {
-                            newCorners[i] = corners[i] + offsetX;
-                            newCorners[i + 1] = corners[i + 1] + offsetY;
+                    try (var croppedImage = cropped.output) {
+                        if (paddedResult.output.width * paddedResult.output.height >= DECIMATE_6_THRESHOLD) {
+                            config.quadDecimate = 6;
+                        } else if (paddedResult.output.width * paddedResult.output.height
+                                >= DECIMATE_3_THRESHOLD) {
+                            config.quadDecimate = 3;
+                        } else {
+                            config.quadDecimate = defaultDecimate;
                         }
 
-                        detections.add(
-                                new AprilTagDetection(
-                                        tagDetection.getFamily(),
-                                        tagDetection.getId(),
-                                        tagDetection.getHamming(),
-                                        tagDetection.getDecisionMargin(),
-                                        tagDetection.getHomography(),
-                                        tagDetection.getCenterX() + offsetX,
-                                        tagDetection.getCenterY() + offsetY,
-                                        newCorners));
-                        mltagNoneFound = false;
+                        aprilTagDetectionPipe.setConfig(config);
+
+                        CVPipeResult<List<AprilTagDetection>> tagDetectionPipeResult =
+                                aprilTagDetectionPipe.run(
+                                        croppedImage != null ? croppedImage : frame.processedImage);
+                        sumPipeNanosElapsed += tagDetectionPipeResult.nanosElapsed;
+
+                        var cropRect = cropPipe.effectiveCrop(inputMat.cols(), inputMat.rows());
+                        double offsetX = cropRect != null ? cropRect.x : 0;
+                        double offsetY = cropRect != null ? cropRect.y : 0;
+                        for (var tagDetection : tagDetectionPipeResult.output) {
+                            var corners = tagDetection.getCorners();
+                            var newCorners = new double[8];
+                            for (var i = 0; i < corners.length; i += 2) {
+                                newCorners[i] = corners[i] + offsetX;
+                                newCorners[i + 1] = corners[i + 1] + offsetY;
+                            }
+
+                            detections.add(
+                                    new AprilTagDetection(
+                                            tagDetection.getFamily(),
+                                            tagDetection.getId(),
+                                            tagDetection.getHamming(),
+                                            tagDetection.getDecisionMargin(),
+                                            tagDetection.getHomography(),
+                                            tagDetection.getCenterX() + offsetX,
+                                            tagDetection.getCenterY() + offsetY,
+                                            newCorners));
+                            mltagNoneFound = false;
+                        }
                     }
                 }
             } finally {
@@ -269,120 +280,137 @@ public class AprilTagPipeline extends CVPipeline<CVPipelineResult, AprilTagPipel
         // Turn the model's proposed regions into targets the same way the object detection pipeline
         // does; the output stream pipeline draws them on the output stream
         List<TrackedTarget> mlROIs = List.of();
-        if (!mlDetections.isEmpty()) {
-            var collectMLROIsResult =
-                    collect2dMLROIsPipe.run(mlDetections.stream().map(PotentialTarget::new).toList());
-            sumPipeNanosElapsed += collectMLROIsResult.nanosElapsed;
-            mlROIs = collectMLROIsResult.output;
-        }
-
-        List<AprilTagDetection> usedDetections = new ArrayList<>();
         List<TrackedTarget> targetList = new ArrayList<>();
-
-        // Filter out detections based on pipeline settings
-        for (AprilTagDetection detection : detections) {
-            // TODO this should be in a pipe, not in the top level here (Matt)
-            if (detection.getDecisionMargin() < settings.decisionMargin) continue;
-            if (detection.getHamming() > settings.hammingDist) continue;
-
-            usedDetections.add(detection);
-
-            // Populate target list for multitag
-            // (TODO: Address circular dependencies. Multitag only requires corners and IDs, this should
-            // not be necessary.)
-            TrackedTarget target =
-                    new TrackedTarget(
-                            detection,
-                            null,
-                            new TargetCalculationParameters(
-                                    false, null, null, null, null, frameStaticProperties));
-
-            targetList.add(target);
-        }
-
-        // Do multi-tag pose estimation
-        Optional<MultiTargetPNPResult> multiTagResult = Optional.empty();
-        if (settings.solvePNPEnabled && settings.doMultiTarget) {
-            var multiTagOutput = multiTagPNPPipe.run(targetList);
-            sumPipeNanosElapsed += multiTagOutput.nanosElapsed;
-            multiTagResult = multiTagOutput.output;
-        }
-
-        // Do single-tag pose estimation
-        if (settings.solvePNPEnabled) {
-            // Clear target list that was used for multitag so we can add target transforms
-            targetList.clear();
-            // TODO global state again ew
-            var field = ConfigManager.getInstance().getConfig().getFieldLayout();
-
-            for (AprilTagDetection detection : usedDetections) {
-                AprilTagPoseEstimate tagPoseEstimate = null;
-                // Do single-tag estimation when "always enabled" or if a tag was not used for multitag
-                if (settings.doSingleTargetAlways
-                        || !(multiTagResult.isPresent()
-                                && multiTagResult.get().fiducialIDsUsed.contains((short) detection.getId()))) {
-                    var poseResult = singleTagPoseEstimatorPipe.run(detection);
-                    sumPipeNanosElapsed += poseResult.nanosElapsed;
-                    tagPoseEstimate = poseResult.output;
-                }
-
-                // If single-tag estimation was not done, this is a multi-target tag from the layout
-                if (tagPoseEstimate == null && multiTagResult.isPresent()) {
-                    // compute this tag's camera-to-tag transform using the multitag result
-                    var tagPose = field.getTagPose(detection.getId());
-                    if (tagPose.isPresent()) {
-                        var camToTag =
-                                new Transform3d(
-                                        new Pose3d().plus(multiTagResult.get().estimatedPose.best), tagPose.get());
-                        // match expected AprilTag coordinate system
-                        camToTag =
-                                CoordinateSystem.convert(camToTag, CoordinateSystem.NWU(), CoordinateSystem.EDN());
-                        // (AprilTag expects Z axis going into tag)
-                        camToTag =
-                                new Transform3d(
-                                        camToTag.getTranslation(),
-                                        new Rotation3d(0, Math.PI, 0).rotateBy(camToTag.getRotation()));
-                        tagPoseEstimate = new AprilTagPoseEstimate(camToTag, camToTag, 0, 0);
+        try {
+            if (!mlDetections.isEmpty()) {
+                var potentialROIs = new ArrayList<PotentialTarget>();
+                try {
+                    for (var detection : mlDetections) {
+                        potentialROIs.add(new PotentialTarget(detection));
                     }
+                    var collectMLROIsResult = collect2dMLROIsPipe.run(potentialROIs);
+                    sumPipeNanosElapsed += collectMLROIsResult.nanosElapsed;
+                    mlROIs = collectMLROIsResult.output;
+                } catch (RuntimeException | Error ex) {
+                    potentialROIs.forEach(PotentialTarget::release);
+                    throw ex;
                 }
+            }
 
-                // populate the target list
-                // Challenge here is that TrackedTarget functions with OpenCV Contour
+            List<AprilTagDetection> usedDetections = new ArrayList<>();
+
+            // Filter out detections based on pipeline settings
+            for (AprilTagDetection detection : detections) {
+                // TODO this should be in a pipe, not in the top level here (Matt)
+                if (detection.getDecisionMargin() < settings.decisionMargin) continue;
+                if (detection.getHamming() > settings.hammingDist) continue;
+
+                usedDetections.add(detection);
+
+                // Populate target list for multitag
+                // (TODO: Address circular dependencies. Multitag only requires corners and IDs, this should
+                // not be necessary.)
                 TrackedTarget target =
                         new TrackedTarget(
                                 detection,
-                                tagPoseEstimate,
+                                null,
                                 new TargetCalculationParameters(
                                         false, null, null, null, null, frameStaticProperties));
 
-                var correctedBestPose =
-                        MathUtils.convertOpenCVtoPhotonTransform(target.getBestCameraToTarget3d());
-                var correctedAltPose =
-                        MathUtils.convertOpenCVtoPhotonTransform(target.getAltCameraToTarget3d());
-
-                target.setBestCameraToTarget3d(
-                        new Transform3d(correctedBestPose.getTranslation(), correctedBestPose.getRotation()));
-                target.setAltCameraToTarget3d(
-                        new Transform3d(correctedAltPose.getTranslation(), correctedAltPose.getRotation()));
-
                 targetList.add(target);
             }
+
+            // Do multi-tag pose estimation
+            Optional<MultiTargetPNPResult> multiTagResult = Optional.empty();
+            if (settings.solvePNPEnabled && settings.doMultiTarget) {
+                var multiTagOutput = multiTagPNPPipe.run(targetList);
+                sumPipeNanosElapsed += multiTagOutput.nanosElapsed;
+                multiTagResult = multiTagOutput.output;
+            }
+
+            // Do single-tag pose estimation
+            if (settings.solvePNPEnabled) {
+                // Clear target list that was used for multitag so we can add target transforms
+                targetList.forEach(TrackedTarget::release);
+                targetList.clear();
+                // TODO global state again ew
+                var field = ConfigManager.getInstance().getConfig().getFieldLayout();
+
+                for (AprilTagDetection detection : usedDetections) {
+                    AprilTagPoseEstimate tagPoseEstimate = null;
+                    // Do single-tag estimation when "always enabled" or if a tag was not used for multitag
+                    if (settings.doSingleTargetAlways
+                            || !(multiTagResult.isPresent()
+                                    && multiTagResult.get().fiducialIDsUsed.contains((short) detection.getId()))) {
+                        var poseResult = singleTagPoseEstimatorPipe.run(detection);
+                        sumPipeNanosElapsed += poseResult.nanosElapsed;
+                        tagPoseEstimate = poseResult.output;
+                    }
+
+                    // If single-tag estimation was not done, this is a multi-target tag from the layout
+                    if (tagPoseEstimate == null && multiTagResult.isPresent()) {
+                        // compute this tag's camera-to-tag transform using the multitag result
+                        var tagPose = field.getTagPose(detection.getId());
+                        if (tagPose.isPresent()) {
+                            var camToTag =
+                                    new Transform3d(
+                                            new Pose3d().plus(multiTagResult.get().estimatedPose.best), tagPose.get());
+                            // match expected AprilTag coordinate system
+                            camToTag =
+                                    CoordinateSystem.convert(
+                                            camToTag, CoordinateSystem.NWU(), CoordinateSystem.EDN());
+                            // (AprilTag expects Z axis going into tag)
+                            camToTag =
+                                    new Transform3d(
+                                            camToTag.getTranslation(),
+                                            new Rotation3d(0, Math.PI, 0).rotateBy(camToTag.getRotation()));
+                            tagPoseEstimate = new AprilTagPoseEstimate(camToTag, camToTag, 0, 0);
+                        }
+                    }
+
+                    // populate the target list
+                    // Challenge here is that TrackedTarget functions with OpenCV Contour
+                    TrackedTarget target =
+                            new TrackedTarget(
+                                    detection,
+                                    tagPoseEstimate,
+                                    new TargetCalculationParameters(
+                                            false, null, null, null, null, frameStaticProperties));
+                    targetList.add(target);
+
+                    var correctedBestPose =
+                            MathUtils.convertOpenCVtoPhotonTransform(target.getBestCameraToTarget3d());
+                    var correctedAltPose =
+                            MathUtils.convertOpenCVtoPhotonTransform(target.getAltCameraToTarget3d());
+
+                    target.setBestCameraToTarget3d(
+                            new Transform3d(correctedBestPose.getTranslation(), correctedBestPose.getRotation()));
+                    target.setAltCameraToTarget3d(
+                            new Transform3d(correctedAltPose.getTranslation(), correctedAltPose.getRotation()));
+                }
+            }
+
+            if (targetList.size() > Packet.MAX_ARRAY_LEN) {
+                logger.error(
+                        "We have " + targetList.size() + " targets! Arbitrarily dropping some on the floor");
+                var discardedTargets = targetList.subList(Packet.MAX_ARRAY_LEN, targetList.size());
+                discardedTargets.forEach(TrackedTarget::release);
+                discardedTargets.clear();
+            }
+
+            var fpsResult = calculateFPSPipe.run(null);
+            var fps = fpsResult.output;
+
+            var result =
+                    new CVPipelineResult(
+                            frame.sequenceID, sumPipeNanosElapsed, fps, targetList, multiTagResult, frame);
+            result.mlROIs = mlROIs;
+            return result;
+        } catch (RuntimeException | Error ex) {
+            targetList.forEach(TrackedTarget::release);
+            mlROIs.forEach(TrackedTarget::release);
+            throw ex;
         }
-
-        if (targetList.size() > Packet.MAX_ARRAY_LEN) {
-            logger.error(
-                    "We have " + targetList.size() + " targets! Arbitrarily dropping some on the floor");
-            targetList = targetList.subList(0, Packet.MAX_ARRAY_LEN);
-        }
-
-        var fpsResult = calculateFPSPipe.run(null);
-        var fps = fpsResult.output;
-
-        var result =
-                new CVPipelineResult(
-                        frame.sequenceID, sumPipeNanosElapsed, fps, targetList, multiTagResult, frame);
-        result.mlROIs = mlROIs;
-        return result;
     }
 
     @Override

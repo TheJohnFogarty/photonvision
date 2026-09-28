@@ -284,6 +284,7 @@ public class OutputStreamPipeline implements Releasable {
         outputMatPipe.release();
         draw2dCrosshairPipe.release();
         draw2dTargetsPipe.release();
+        draw2dMLROIsPipe.release();
         draw3dTargetsPipe.release();
         draw2dAprilTagsPipe.release();
         draw3dAprilTagsPipe.release();

@@ -69,23 +69,38 @@ public class RknnObjectDetector implements ObjectDetector {
                 new Size(model.properties.resolutionWidth(), model.properties.resolutionHeight());
 
         // Create the detector
-        objPointer =
-                RknnJNI.create(
-                        model.modelFile.getPath(),
-                        model.properties.labels().size(),
-                        model.properties.version().ordinal(),
-                        -1);
-        if (objPointer <= 0) {
-            throw new RuntimeException(
-                    "Failed to create detector from path " + model.modelFile.getPath());
-        } else if (!RknnJNI.isQuantized(objPointer)) {
-            throw new UnsupportedOperationException("Model must be quantized.");
+        try {
+            objPointer =
+                    RknnJNI.create(
+                            model.modelFile.getPath(),
+                            model.properties.labels().size(),
+                            model.properties.version().ordinal(),
+                            -1);
+        } catch (RuntimeException | Error e) {
+            letterboxed.release();
+            throw e;
         }
 
-        logger.debug("Created detector for model " + model.modelFile.getName());
+        try {
+            if (objPointer <= 0) {
+                throw new RuntimeException(
+                        "Failed to create detector from path " + model.modelFile.getPath());
+            } else if (!RknnJNI.isQuantized(objPointer)) {
+                throw new UnsupportedOperationException("Model must be quantized.");
+            }
 
-        // Register the cleaner to release the detector when it goes out of scope
-        cleanable = cleaner.register(this, cleanupAction(objPointer));
+            logger.debug("Created detector for model " + model.modelFile.getName());
+
+            // Only transfer ownership to the cleaner after initialization succeeds.
+            cleanable = cleaner.register(this, cleanupAction(objPointer));
+        } catch (RuntimeException | Error e) {
+            try {
+                if (objPointer > 0) RknnJNI.destroy(objPointer);
+            } finally {
+                letterboxed.release();
+            }
+            throw e;
+        }
     }
 
     /**

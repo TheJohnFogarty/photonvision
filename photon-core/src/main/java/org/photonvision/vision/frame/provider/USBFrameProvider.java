@@ -159,6 +159,7 @@ public class USBFrameProvider extends CpuImageProcessor {
 
     @Override
     public void release() {
+        super.release();
         CameraServer.removeServer(cvSink.getName());
         cvSink.close();
         cvSink = null;
