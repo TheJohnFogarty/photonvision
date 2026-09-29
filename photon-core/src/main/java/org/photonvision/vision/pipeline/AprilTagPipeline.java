@@ -18,6 +18,7 @@
 package org.photonvision.vision.pipeline;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Optional;
 import org.photonvision.common.configuration.ConfigManager;
@@ -248,13 +249,22 @@ public class AprilTagPipeline extends CVPipeline<CVPipelineResult, AprilTagPipel
                                 newCorners[i + 1] = corners[i + 1] + offsetY;
                             }
 
+                            // Pose estimation uses both corners and homography with this frame's
+                            // calibration. Translate H into the same coordinates: H_frame = T * H_roi.
+                            var homography = tagDetection.getHomography();
+                            var frameHomography = homography.clone();
+                            for (int j = 0; j < 3; j++) {
+                                frameHomography[j] += offsetX * homography[6 + j];
+                                frameHomography[3 + j] += offsetY * homography[6 + j];
+                            }
+
                             detections.add(
                                     new AprilTagDetection(
                                             tagDetection.getFamily(),
                                             tagDetection.getId(),
                                             tagDetection.getHamming(),
                                             tagDetection.getDecisionMargin(),
-                                            tagDetection.getHomography(),
+                                            frameHomography,
                                             tagDetection.getCenterX() + offsetX,
                                             tagDetection.getCenterY() + offsetY,
                                             newCorners));
@@ -306,7 +316,23 @@ public class AprilTagPipeline extends CVPipeline<CVPipelineResult, AprilTagPipel
                 if (detection.getHamming() > settings.hammingDist) continue;
 
                 usedDetections.add(detection);
+            }
 
+            if (settings.mltagEnabled && !mltagNoneFound) {
+                // Overlapping ML regions can decode the same tag. Keep the strongest valid
+                // observation before constructing targets or counting tags for multi-tag PNP.
+                // Full-frame detection (including fallback) retains its existing behavior.
+                var detectionsById = new LinkedHashMap<Integer, AprilTagDetection>();
+                for (var detection : usedDetections) {
+                    var existing = detectionsById.get(detection.getId());
+                    if (existing == null || detection.getDecisionMargin() > existing.getDecisionMargin()) {
+                        detectionsById.put(detection.getId(), detection);
+                    }
+                }
+                usedDetections = new ArrayList<>(detectionsById.values());
+            }
+
+            for (AprilTagDetection detection : usedDetections) {
                 // Populate target list for multitag
                 // (TODO: Address circular dependencies. Multitag only requires corners and IDs, this should
                 // not be necessary.)
