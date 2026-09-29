@@ -189,17 +189,18 @@ public class AprilTagPipeline extends CVPipeline<CVPipelineResult, AprilTagPipel
         }
 
         List<AprilTagDetection> usedDetections = new ArrayList<>();
-        List<NeuralNetworkPipeResult> mlDetections = List.of();
+        List<NeuralNetworkPipeResult> mlCropRegions = List.of();
         boolean hadRoiDetections = false;
         if (settings.mltagEnabled) {
             var odResults = objectDetectionPipe.run(frame.colorImage);
             sumPipeNanosElapsed += odResults.nanosElapsed;
-            mlDetections = odResults.output;
             var roiResults =
-                    roiDecodePipe.run(new AprilTagRoiDecodePipe.Input(frame.processedImage, mlDetections));
+                    roiDecodePipe.run(
+                            new AprilTagRoiDecodePipe.Input(frame.processedImage, odResults.output));
             sumPipeNanosElapsed += roiResults.nanosElapsed;
             usedDetections = roiResults.output.detections();
             hadRoiDetections = roiResults.output.hadRawDetections();
+            mlCropRegions = roiResults.output.cropRegions();
         }
 
         if (!settings.mltagEnabled || (!hadRoiDetections && settings.mltagFallbackEnabled)) {
@@ -309,10 +310,10 @@ public class AprilTagPipeline extends CVPipeline<CVPipelineResult, AprilTagPipel
             }
 
             // Allocate overlay contours only after pose estimation succeeds.
-            if (!mlDetections.isEmpty()) {
+            if (!mlCropRegions.isEmpty()) {
                 var potentialROIs = new ArrayList<PotentialTarget>();
                 try {
-                    for (var detection : mlDetections) {
+                    for (var detection : mlCropRegions) {
                         potentialROIs.add(new PotentialTarget(detection));
                     }
                     var collectMLROIsResult = collect2dMLROIsPipe.run(potentialROIs);
