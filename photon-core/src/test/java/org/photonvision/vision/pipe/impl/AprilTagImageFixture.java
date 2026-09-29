@@ -99,7 +99,8 @@ final class AprilTagImageFixture implements AutoCloseable {
                 List.of(),
                 new Size(),
                 0,
-                CameraLensModel.LENSMODEL_OPENCV);
+                CameraLensModel.LENSMODEL_OPENCV,
+                new CameraCalibrationCoefficients.OptimizationInputs(List.of()));
     }
 
     AprilTagRoiDecodePipe.Output decode(Rect... regions) {
