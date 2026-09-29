@@ -135,32 +135,44 @@ public abstract class FrameProvider implements Supplier<Frame>, Releasable {
         }
 
         CVMat contextImage = null;
-        if (keepContext && !frame.colorImage.getMat().empty()) {
-            Mat dimmed = new Mat();
-            frame.colorImage.getMat().convertTo(dimmed, -1, CONTEXT_DIM_FACTOR, 0);
-            frame.colorImage.getMat().submat(effectiveCrop).copyTo(dimmed.submat(effectiveCrop));
-            contextImage = new CVMat(dimmed);
-        }
+        try {
+            if (keepContext && !frame.colorImage.getMat().empty()) {
+                contextImage = new CVMat();
+                Mat sourceCrop = null;
+                Mat contextCrop = null;
+                try {
+                    frame.colorImage.getMat().convertTo(contextImage.getMat(), -1, CONTEXT_DIM_FACTOR, 0);
+                    sourceCrop = frame.colorImage.getMat().submat(effectiveCrop);
+                    contextCrop = contextImage.getMat().submat(effectiveCrop);
+                    sourceCrop.copyTo(contextCrop);
+                } finally {
+                    if (sourceCrop != null) sourceCrop.release();
+                    if (contextCrop != null) contextCrop.release();
+                }
+            }
 
-        boolean cropped = cropInPlace(frame.colorImage);
-        cropped |= cropInPlace(frame.processedImage);
-        if (!cropped) {
+            boolean cropped = cropInPlace(frame.colorImage);
+            cropped |= cropInPlace(frame.processedImage);
+            if (!cropped) {
+                return frame;
+            }
+
+            var croppedFrame =
+                    new Frame(
+                            frame.sequenceID,
+                            frame.colorImage,
+                            frame.processedImage,
+                            frame.type,
+                            frame.timestampNanos,
+                            frame.frameStaticProperties != null
+                                    ? cropPipe.croppedProperties(frame.frameStaticProperties, effectiveCrop)
+                                    : null);
+            croppedFrame.contextColorImage = contextImage;
+            contextImage = null; // Ownership passes to the returned frame only after success.
+            return croppedFrame;
+        } finally {
             if (contextImage != null) contextImage.release();
-            return frame;
         }
-
-        var croppedFrame =
-                new Frame(
-                        frame.sequenceID,
-                        frame.colorImage,
-                        frame.processedImage,
-                        frame.type,
-                        frame.timestampNanos,
-                        frame.frameStaticProperties != null
-                                ? cropPipe.croppedProperties(frame.frameStaticProperties, effectiveCrop)
-                                : null);
-        croppedFrame.contextColorImage = contextImage;
-        return croppedFrame;
     }
 
     private boolean cropInPlace(CVMat image) {
@@ -169,10 +181,19 @@ public abstract class FrameProvider implements Supplier<Frame>, Releasable {
             return false;
         }
 
-        Mat cropped = result.output.getMat().clone();
-        result.output.release();
-        cropped.copyTo(image.getMat());
-        cropped.release();
-        return true;
+        Mat cropped = null;
+        try {
+            cropped = result.output.getMat().clone();
+            cropped.copyTo(image.getMat());
+            return true;
+        } finally {
+            result.output.release();
+            if (cropped != null) cropped.release();
+        }
+    }
+
+    @Override
+    public void release() {
+        cropPipe.release();
     }
 }

@@ -337,7 +337,8 @@ public class TrackedTarget implements Releasable {
 
     @Override
     public void release() {
-        m_mainContour.release();
+        if (m_shape != null) m_shape.release();
+        if (m_shape == null || m_shape.contour != m_mainContour) m_mainContour.release();
 
         // TODO how can this check fail?
         if (m_subContours != null) {

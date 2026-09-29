@@ -41,7 +41,10 @@ public class ObjectDetectionPipe
     protected List<NeuralNetworkPipeResult> process(CVMat in) {
         // Check if the model has changed
         if (detector.getModel() != params.model()) {
-            detector.release();
+            // A failed load must not leave a released detector selected for the next frame.
+            var previousDetector = detector;
+            detector = NullModel.getInstance();
+            previousDetector.release();
             detector = params.model().load();
         }
 

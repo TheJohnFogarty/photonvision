@@ -148,7 +148,7 @@ public class VisionSourceManager implements AutoCloseable {
      */
     public synchronized boolean reactivateDisabledCameraConfig(String uniqueName) {
         // Make sure we have an old, currently -inactive- camera around
-        var deactivatedConfig = Optional.ofNullable(this.disabledCameraConfigs.remove(uniqueName));
+        var deactivatedConfig = Optional.ofNullable(this.disabledCameraConfigs.get(uniqueName));
         if (deactivatedConfig.isEmpty() || !deactivatedConfig.get().deactivated) {
             // Not in map, give up
             return false;
@@ -166,11 +166,23 @@ public class VisionSourceManager implements AutoCloseable {
             logger.error(
                     "Camera unique-path already in use by active VisionModule! Cannot reactivate "
                             + deactivatedConfig.get().nickname);
+            return false;
         }
 
         // transform the camera info all the way to a VisionModule and then start it
-        var created =
-                deactivatedConfig.map(this::loadVisionSourceFromCamConfig).map(vmm::addSource).isPresent();
+        this.disabledCameraConfigs.remove(uniqueName);
+        final boolean created;
+        try {
+            created =
+                    deactivatedConfig
+                            .map(this::loadVisionSourceFromCamConfig)
+                            .map(vmm::addSource)
+                            .isPresent();
+        } catch (RuntimeException | Error failure) {
+            deactivatedConfig.get().deactivated = true;
+            this.disabledCameraConfigs.put(uniqueName, deactivatedConfig.get());
+            throw failure;
+        }
 
         if (!created) {
             // Couldn't create a VM for this config - restore state

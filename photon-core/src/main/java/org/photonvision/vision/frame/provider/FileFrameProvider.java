@@ -125,6 +125,7 @@ public class FileFrameProvider extends CpuImageProcessor implements Releasable {
 
     @Override
     public void release() {
+        super.release();
         originalFrame.release();
     }
 

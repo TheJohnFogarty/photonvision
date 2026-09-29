@@ -25,6 +25,7 @@ import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.util.ArrayList;
 import java.util.List;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -35,6 +36,7 @@ import org.opencv.core.Rect;
 import org.opencv.core.Scalar;
 import org.opencv.core.Size;
 import org.photonvision.common.LoadJNI;
+import org.photonvision.common.util.TestUtils;
 import org.photonvision.common.util.numbers.IntegerCouple;
 import org.photonvision.vision.calibration.CameraCalibrationCoefficients;
 import org.photonvision.vision.calibration.CameraLensModel;
@@ -43,6 +45,7 @@ import org.photonvision.vision.frame.Frame;
 import org.photonvision.vision.frame.FrameProvider;
 import org.photonvision.vision.frame.FrameStaticProperties;
 import org.photonvision.vision.frame.FrameThresholdType;
+import org.photonvision.vision.frame.provider.FileFrameProvider;
 import org.photonvision.vision.opencv.CVMat;
 import org.photonvision.vision.opencv.ImageRotationMode;
 import org.photonvision.vision.pipeline.AdvancedPipelineSettings;
@@ -89,9 +92,6 @@ public class CropPipeTest {
 
         @Override
         public void requestBlockForFrames(boolean blockForFrames) {}
-
-        @Override
-        public void release() {}
     }
 
     /** A crop pipe configured to crop to the given rectangle, for a non-apriltag pipeline. */
@@ -243,6 +243,33 @@ public class CropPipeTest {
     }
 
     @Test
+    public void closingTheProviderReleasesOnlyTheCroppedCalibration() {
+        var cal = calibration();
+        var props = new FrameStaticProperties(640, 480, 70.0, cal);
+        try (var provider =
+                new FileFrameProvider(
+                        TestUtils.getWPIImagePath(TestUtils.WPI2020Image.kBlueGoal_108in_Center, false),
+                        70.0)) {
+            provider.setCropParams(settings(new IntegerCouple(100, 300), new IntegerCouple(50, 200)));
+            try (var cropped = provider.cropFrame(uniformFrame(640, 480, 200, props), false)) {
+                var croppedCal = cropped.frameStaticProperties.cameraCalibration;
+                assertNotNull(croppedCal.getCameraIntrinsicsMat());
+
+                provider.close();
+
+                assertThrows(
+                        RuntimeException.class,
+                        () -> croppedCal.getCameraIntrinsicsMat(),
+                        "Closing the provider should release its cropped calibration");
+                assertNotNull(cal.getCameraIntrinsicsMat(), "The source calibration is borrowed");
+                assertEquals(200, cropped.colorImage.getMat().cols(), "The caller still owns the frame");
+            }
+        } finally {
+            cal.release();
+        }
+    }
+
+    @Test
     public void releasingThePipeReleasesTheCachedCalibration() {
         var cal = calibration();
         var props = new FrameStaticProperties(640, 480, 70.0, cal);
@@ -286,6 +313,51 @@ public class CropPipeTest {
 
         cropped.release();
         assertTrue(context.isReleased(), "The context image is owned by the frame");
+    }
+
+    @Test
+    public void cropFrameReleasesTemporaryViews() {
+        var views = new ArrayList<Mat>();
+        var color =
+                new Mat(480, 640, CvType.CV_8UC3, new Scalar(200, 200, 200)) {
+                    @Override
+                    public Mat submat(Rect roi) {
+                        var view = super.submat(roi);
+                        views.add(view);
+                        return view;
+                    }
+                };
+        try (var provider = providerFor(100, 300, 50, 200);
+                var frame =
+                        new Frame(0, new CVMat(color), new CVMat(), FrameThresholdType.GREYSCALE, 0, null);
+                var cropped = provider.cropFrame(frame, true)) {
+            assertEquals(2, views.size(), "Context restoration and in-place cropping each create a view");
+            for (var view : views) {
+                assertTrue(view.empty(), "Crop views must release their native image references");
+            }
+        } finally {
+            views.forEach(Mat::release);
+        }
+    }
+
+    @Test
+    public void failedCroppingReleasesContextButKeepsCallerImages() {
+        var props =
+                new FrameStaticProperties(640, 480, 70.0, null) {
+                    @Override
+                    public FrameStaticProperties crop(Rect cropRect) {
+                        throw new IllegalStateException("Cannot derive cropped properties");
+                    }
+                };
+        try (var provider = providerFor(100, 300, 50, 200);
+                var frame = uniformFrame(640, 480, 200, props)) {
+            int allocatedBefore = CVMat.getMatCount();
+            assertThrows(IllegalStateException.class, () -> provider.cropFrame(frame, true));
+            assertEquals(allocatedBefore, CVMat.getMatCount(), "Temporary crop images must be released");
+            assertEquals(200, frame.colorImage.getMat().cols(), "The caller still owns the color image");
+            assertEquals(
+                    200, frame.processedImage.getMat().cols(), "The caller still owns the processed image");
+        }
     }
 
     @Test

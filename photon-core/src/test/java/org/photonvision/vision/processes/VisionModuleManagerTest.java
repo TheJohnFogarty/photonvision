@@ -17,7 +17,9 @@
 
 package org.photonvision.vision.processes;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
 
@@ -40,6 +42,7 @@ import org.photonvision.vision.frame.FrameProvider;
 import org.photonvision.vision.frame.FrameStaticProperties;
 import org.photonvision.vision.frame.provider.FileFrameProvider;
 import org.photonvision.vision.pipeline.result.CVPipelineResult;
+import org.wpilib.util.Alert;
 import org.wpilib.vision.camera.VideoMode;
 
 public class VisionModuleManagerTest {
@@ -54,6 +57,7 @@ public class VisionModuleManagerTest {
 
     private static class TestSource extends VisionSource {
         private final FrameProvider provider;
+        int releaseCount;
 
         public TestSource(FrameProvider provider, CameraConfiguration cameraConfiguration) {
             super(cameraConfiguration);
@@ -89,6 +93,7 @@ public class VisionModuleManagerTest {
 
         @Override
         public void release() {
+            releaseCount++;
             provider.release();
         }
     }
@@ -160,6 +165,66 @@ public class VisionModuleManagerTest {
         @Override
         public void accept(CVPipelineResult result) {
             this.result = result;
+        }
+    }
+
+    private static FileFrameProvider lifecycleFrameProvider() {
+        return new FileFrameProvider(
+                TestUtils.getWPIImagePath(TestUtils.WPI2019Image.kCargoStraightDark72in_HighRes, false),
+                TestUtils.WPI2019Image.FOV);
+    }
+
+    @Test
+    public void failedAlertAllocationReleasesSource() {
+        ConfigManager.getInstance().load();
+        var provider = lifecycleFrameProvider();
+        var source =
+                new TestSource(
+                        provider,
+                        new CameraConfiguration(
+                                PVCameraInfo.fromFileInfo("allocation-failure", "allocation-failure")));
+        try (var manager = new VisionModuleManager();
+                var occupied =
+                        new Alert("PhotonAlerts", provider.getName(), "occupied", Alert.Level.MEDIUM)) {
+            assertThrows(RuntimeException.class, () -> manager.addSource(source));
+            assertEquals(1, source.releaseCount);
+            assertTrue(manager.getModules().isEmpty());
+        }
+    }
+
+    @Test
+    public void failedModuleInitializationReleasesAlertAndSource() {
+        ConfigManager.getInstance().load();
+        var provider = lifecycleFrameProvider();
+        var source =
+                new TestSource(
+                        provider,
+                        new CameraConfiguration(
+                                PVCameraInfo.fromFileInfo("initialization-failure", "initialization-failure")));
+        var alertId = provider.getName();
+        try (var manager = new VisionModuleManager()) {
+            // A failing caller-supplied collection fails after the module has created its streams.
+            var consumers =
+                    new java.util.AbstractCollection<CVPipelineResultConsumer>() {
+                        @Override
+                        public java.util.Iterator<CVPipelineResultConsumer> iterator() {
+                            throw new IllegalStateException("injected initialization failure");
+                        }
+
+                        @Override
+                        public int size() {
+                            return 1;
+                        }
+                    };
+            var failure =
+                    assertThrows(IllegalStateException.class, () -> manager.addSource(source, consumers));
+            assertEquals("injected initialization failure", failure.getMessage());
+            assertEquals(1, source.releaseCount);
+            assertTrue(manager.getModules().isEmpty());
+            try (var replacement =
+                    new Alert("PhotonAlerts", alertId, "replacement", Alert.Level.MEDIUM)) {
+                replacement.set(false);
+            }
         }
     }
 
