@@ -20,6 +20,8 @@ package org.photonvision.vision.pipe.impl;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
+import org.opencv.core.Rect;
+import org.opencv.core.Rect2d;
 import org.photonvision.vision.opencv.CVMat;
 import org.photonvision.vision.pipe.CVPipe;
 import org.photonvision.vision.pipeline.AprilTagPipelineSettings;
@@ -46,11 +48,15 @@ public class AprilTagRoiDecodePipe
     public record Input(CVMat image, List<NeuralNetworkPipeResult> regions) {}
 
     /** Raw detections suppress full-frame fallback even when quality filtering rejects them all. */
-    public record Output(List<AprilTagDetection> detections, boolean hadRawDetections) {}
+    public record Output(
+            List<AprilTagDetection> detections,
+            boolean hadRawDetections,
+            List<NeuralNetworkPipeResult> cropRegions) {}
 
     @Override
     protected Output process(Input input) {
         var detectionsById = new LinkedHashMap<Integer, AprilTagDetection>();
+        List<NeuralNetworkPipeResult> cropRegions = new ArrayList<>();
         boolean hadRawDetections = false;
         var image = input.image().getMat();
         var config = detector.getParams().detectorParams();
@@ -74,6 +80,12 @@ public class AprilTagRoiDecodePipe
                     var detections = detector.run(croppedImage != null ? croppedImage : input.image()).output;
                     hadRawDetections |= !detections.isEmpty();
                     var cropRect = cropPipe.effectiveCrop(image.cols(), image.rows());
+                    var roiRect = cropRect != null ? cropRect : new Rect(0, 0, image.cols(), image.rows());
+                    cropRegions.add(
+                            new NeuralNetworkPipeResult(
+                                    new Rect2d(roiRect.x, roiRect.y, roiRect.width, roiRect.height),
+                                    region.classIdx(),
+                                    region.confidence()));
                     double offsetX = cropRect != null ? cropRect.x : 0;
                     double offsetY = cropRect != null ? cropRect.y : 0;
 
@@ -119,7 +131,7 @@ public class AprilTagRoiDecodePipe
             detector.setConfig(config);
         }
 
-        return new Output(new ArrayList<>(detectionsById.values()), hadRawDetections);
+        return new Output(new ArrayList<>(detectionsById.values()), hadRawDetections, cropRegions);
     }
 
     @Override
