@@ -18,7 +18,6 @@
 package org.photonvision.vision.pipeline;
 
 import java.util.ArrayList;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Optional;
 import org.photonvision.common.configuration.ConfigManager;
@@ -35,20 +34,18 @@ import org.photonvision.vision.frame.FrameThresholdType;
 import org.photonvision.vision.objects.Model;
 import org.photonvision.vision.objects.NullModel;
 import org.photonvision.vision.opencv.DualOffsetValues;
-import org.photonvision.vision.pipe.CVPipe.CVPipeResult;
 import org.photonvision.vision.pipe.impl.AprilTagDetectionPipe;
 import org.photonvision.vision.pipe.impl.AprilTagDetectionPipe.AprilTagDetectionPipeParams;
 import org.photonvision.vision.pipe.impl.AprilTagPoseEstimatorPipe;
 import org.photonvision.vision.pipe.impl.AprilTagPoseEstimatorPipe.AprilTagPoseEstimatorPipeParams;
+import org.photonvision.vision.pipe.impl.AprilTagRoiDecodePipe;
 import org.photonvision.vision.pipe.impl.CalculateFPSPipe;
 import org.photonvision.vision.pipe.impl.Collect2dTargetsPipe;
-import org.photonvision.vision.pipe.impl.CropPipe;
 import org.photonvision.vision.pipe.impl.MultiTargetPNPPipe;
 import org.photonvision.vision.pipe.impl.MultiTargetPNPPipe.MultiTargetPNPPipeParams;
 import org.photonvision.vision.pipe.impl.NeuralNetworkPipeResult;
 import org.photonvision.vision.pipe.impl.ObjectDetectionPipe;
 import org.photonvision.vision.pipe.impl.ObjectDetectionPipe.ObjectDetectionPipeParams;
-import org.photonvision.vision.pipe.impl.PadRectPipe;
 import org.photonvision.vision.pipeline.result.CVPipelineResult;
 import org.photonvision.vision.target.PotentialTarget;
 import org.photonvision.vision.target.TrackedTarget;
@@ -66,36 +63,25 @@ import org.wpilib.vision.apriltag.AprilTagPoseEstimator.Config;
 public class AprilTagPipeline extends CVPipeline<CVPipelineResult, AprilTagPipelineSettings> {
     private static final Logger logger = new Logger(AprilTagPipeline.class, LogGroup.VisionModule);
 
-    private final AprilTagDetectionPipe aprilTagDetectionPipe;
+    private final AprilTagDetectionPipe aprilTagDetectionPipe = new AprilTagDetectionPipe();
     private final AprilTagPoseEstimatorPipe singleTagPoseEstimatorPipe =
             new AprilTagPoseEstimatorPipe();
     private final MultiTargetPNPPipe multiTagPNPPipe = new MultiTargetPNPPipe();
     private final CalculateFPSPipe calculateFPSPipe = new CalculateFPSPipe();
-    private final ObjectDetectionPipe objectDetectionPipe;
-    private final CropPipe cropPipe = new CropPipe();
-    private final PadRectPipe padRectPipe = new PadRectPipe();
+    private final ObjectDetectionPipe objectDetectionPipe = new ObjectDetectionPipe();
+    private final AprilTagRoiDecodePipe roiDecodePipe =
+            new AprilTagRoiDecodePipe(aprilTagDetectionPipe);
     private final Collect2dTargetsPipe collect2dMLROIsPipe = new Collect2dTargetsPipe();
 
     private static final FrameThresholdType PROCESSING_TYPE = FrameThresholdType.GREYSCALE;
-    private static final int DECIMATE_3_THRESHOLD = 160 * 160;
-    private static final int DECIMATE_6_THRESHOLD = 320 * 320;
 
     public AprilTagPipeline() {
         this(new AprilTagPipelineSettings());
     }
 
     public AprilTagPipeline(AprilTagPipelineSettings settings) {
-        this(settings, new ObjectDetectionPipe(), new AprilTagDetectionPipe());
-    }
-
-    AprilTagPipeline(
-            AprilTagPipelineSettings settings,
-            ObjectDetectionPipe objectDetectionPipe,
-            AprilTagDetectionPipe aprilTagDetectionPipe) {
         super(PROCESSING_TYPE);
         this.settings = settings;
-        this.objectDetectionPipe = objectDetectionPipe;
-        this.aprilTagDetectionPipe = aprilTagDetectionPipe;
     }
 
     @Override
@@ -175,7 +161,7 @@ public class AprilTagPipeline extends CVPipeline<CVPipelineResult, AprilTagPipel
                             settings.mlNms,
                             selectedModel.orElseGet(NullModel::getInstance)));
 
-            padRectPipe.setParams(settings.mlPadding);
+            roiDecodePipe.setParams(settings);
 
             // Same pipes the object detection pipeline uses to turn detections into drawn targets
             collect2dMLROIsPipe.setParams(
@@ -202,136 +188,34 @@ public class AprilTagPipeline extends CVPipeline<CVPipelineResult, AprilTagPipel
             return new CVPipelineResult(frame.sequenceID, 0, 0, List.of(), frame);
         }
 
-        List<AprilTagDetection> detections = new ArrayList<>();
+        List<AprilTagDetection> usedDetections = new ArrayList<>();
         List<NeuralNetworkPipeResult> mlDetections = List.of();
-        boolean mltagNoneFound = true;
+        boolean hadRoiDetections = false;
         if (settings.mltagEnabled) {
             var odResults = objectDetectionPipe.run(frame.colorImage);
             sumPipeNanosElapsed += odResults.nanosElapsed;
             mlDetections = odResults.output;
-            var inputMat = frame.processedImage.getMat();
-            var config = aprilTagDetectionPipe.getParams().detectorParams();
-            float defaultDecimate = settings.decimate;
-            try {
-                for (var result : mlDetections) {
-                    var paddedResult = padRectPipe.run(result.bbox().boundingRect());
-                    sumPipeNanosElapsed += paddedResult.nanosElapsed;
+            var roiResults =
+                    roiDecodePipe.run(new AprilTagRoiDecodePipe.Input(frame.processedImage, mlDetections));
+            sumPipeNanosElapsed += roiResults.nanosElapsed;
+            usedDetections = roiResults.output.detections();
+            hadRoiDetections = roiResults.output.hadRawDetections();
+        }
 
-                    cropPipe.setParams(new CropPipe.CropPipeParams(paddedResult.output, settings));
-                    var cropped = cropPipe.run(frame.processedImage);
-                    sumPipeNanosElapsed += cropped.nanosElapsed;
-
-                    try (var croppedImage = cropped.output) {
-                        if (paddedResult.output.width * paddedResult.output.height >= DECIMATE_6_THRESHOLD) {
-                            config.quadDecimate = 6;
-                        } else if (paddedResult.output.width * paddedResult.output.height
-                                >= DECIMATE_3_THRESHOLD) {
-                            config.quadDecimate = 3;
-                        } else {
-                            config.quadDecimate = defaultDecimate;
-                        }
-
-                        aprilTagDetectionPipe.setConfig(config);
-
-                        CVPipeResult<List<AprilTagDetection>> tagDetectionPipeResult =
-                                aprilTagDetectionPipe.run(
-                                        croppedImage != null ? croppedImage : frame.processedImage);
-                        sumPipeNanosElapsed += tagDetectionPipeResult.nanosElapsed;
-
-                        var cropRect = cropPipe.effectiveCrop(inputMat.cols(), inputMat.rows());
-                        double offsetX = cropRect != null ? cropRect.x : 0;
-                        double offsetY = cropRect != null ? cropRect.y : 0;
-                        for (var tagDetection : tagDetectionPipeResult.output) {
-                            var corners = tagDetection.getCorners();
-                            var newCorners = new double[8];
-                            for (var i = 0; i < corners.length; i += 2) {
-                                newCorners[i] = corners[i] + offsetX;
-                                newCorners[i + 1] = corners[i + 1] + offsetY;
-                            }
-
-                            // Pose estimation uses both corners and homography with this frame's
-                            // calibration. Translate H into the same coordinates: H_frame = T * H_roi.
-                            var homography = tagDetection.getHomography();
-                            var frameHomography = homography.clone();
-                            for (int j = 0; j < 3; j++) {
-                                frameHomography[j] += offsetX * homography[6 + j];
-                                frameHomography[3 + j] += offsetY * homography[6 + j];
-                            }
-
-                            detections.add(
-                                    new AprilTagDetection(
-                                            tagDetection.getFamily(),
-                                            tagDetection.getId(),
-                                            tagDetection.getHamming(),
-                                            tagDetection.getDecisionMargin(),
-                                            frameHomography,
-                                            tagDetection.getCenterX() + offsetX,
-                                            tagDetection.getCenterY() + offsetY,
-                                            newCorners));
-                            mltagNoneFound = false;
-                        }
-                    }
-                }
-            } finally {
-                // Restore the default decimate even if detection throws mid-loop; otherwise the
-                // mutated value would be captured as the "default" on the next frame.
-                config.quadDecimate = defaultDecimate;
-                aprilTagDetectionPipe.setConfig(config);
+        if (!settings.mltagEnabled || (!hadRoiDetections && settings.mltagFallbackEnabled)) {
+            var tagDetectionPipeResult = aprilTagDetectionPipe.run(frame.processedImage);
+            sumPipeNanosElapsed += tagDetectionPipeResult.nanosElapsed;
+            usedDetections = new ArrayList<>();
+            for (var detection : tagDetectionPipeResult.output) {
+                if (detection.getDecisionMargin() < settings.decisionMargin) continue;
+                if (detection.getHamming() > settings.hammingDist) continue;
+                usedDetections.add(detection);
             }
         }
 
-        if (!settings.mltagEnabled || (mltagNoneFound && settings.mltagFallbackEnabled)) {
-            CVPipeResult<List<AprilTagDetection>> tagDetectionPipeResult;
-            tagDetectionPipeResult = aprilTagDetectionPipe.run(frame.processedImage);
-            sumPipeNanosElapsed += tagDetectionPipeResult.nanosElapsed;
-            detections = tagDetectionPipeResult.output;
-        }
-
-        // Turn the model's proposed regions into targets the same way the object detection pipeline
-        // does; the output stream pipeline draws them on the output stream
         List<TrackedTarget> mlROIs = List.of();
         List<TrackedTarget> targetList = new ArrayList<>();
         try {
-            if (!mlDetections.isEmpty()) {
-                var potentialROIs = new ArrayList<PotentialTarget>();
-                try {
-                    for (var detection : mlDetections) {
-                        potentialROIs.add(new PotentialTarget(detection));
-                    }
-                    var collectMLROIsResult = collect2dMLROIsPipe.run(potentialROIs);
-                    sumPipeNanosElapsed += collectMLROIsResult.nanosElapsed;
-                    mlROIs = collectMLROIsResult.output;
-                } catch (RuntimeException | Error ex) {
-                    potentialROIs.forEach(PotentialTarget::release);
-                    throw ex;
-                }
-            }
-
-            List<AprilTagDetection> usedDetections = new ArrayList<>();
-
-            // Filter out detections based on pipeline settings
-            for (AprilTagDetection detection : detections) {
-                // TODO this should be in a pipe, not in the top level here (Matt)
-                if (detection.getDecisionMargin() < settings.decisionMargin) continue;
-                if (detection.getHamming() > settings.hammingDist) continue;
-
-                usedDetections.add(detection);
-            }
-
-            if (settings.mltagEnabled && !mltagNoneFound) {
-                // Overlapping ML regions can decode the same tag. Keep the strongest valid
-                // observation before constructing targets or counting tags for multi-tag PNP.
-                // Full-frame detection (including fallback) retains its existing behavior.
-                var detectionsById = new LinkedHashMap<Integer, AprilTagDetection>();
-                for (var detection : usedDetections) {
-                    var existing = detectionsById.get(detection.getId());
-                    if (existing == null || detection.getDecisionMargin() > existing.getDecisionMargin()) {
-                        detectionsById.put(detection.getId(), detection);
-                    }
-                }
-                usedDetections = new ArrayList<>(detectionsById.values());
-            }
-
             for (AprilTagDetection detection : usedDetections) {
                 // Populate target list for multitag
                 // (TODO: Address circular dependencies. Multitag only requires corners and IDs, this should
@@ -424,6 +308,22 @@ public class AprilTagPipeline extends CVPipeline<CVPipelineResult, AprilTagPipel
                 discardedTargets.clear();
             }
 
+            // Allocate overlay contours only after pose estimation succeeds.
+            if (!mlDetections.isEmpty()) {
+                var potentialROIs = new ArrayList<PotentialTarget>();
+                try {
+                    for (var detection : mlDetections) {
+                        potentialROIs.add(new PotentialTarget(detection));
+                    }
+                    var collectMLROIsResult = collect2dMLROIsPipe.run(potentialROIs);
+                    sumPipeNanosElapsed += collectMLROIsResult.nanosElapsed;
+                    mlROIs = collectMLROIsResult.output;
+                } catch (RuntimeException | Error ex) {
+                    potentialROIs.forEach(PotentialTarget::release);
+                    throw ex;
+                }
+            }
+
             var fpsResult = calculateFPSPipe.run(null);
             var fps = fpsResult.output;
 
@@ -446,7 +346,7 @@ public class AprilTagPipeline extends CVPipeline<CVPipelineResult, AprilTagPipel
         multiTagPNPPipe.release();
         calculateFPSPipe.release();
         objectDetectionPipe.release();
-        cropPipe.release();
+        roiDecodePipe.release();
         collect2dMLROIsPipe.release();
         super.release();
     }
